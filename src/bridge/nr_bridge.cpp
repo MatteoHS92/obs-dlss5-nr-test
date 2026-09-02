@@ -143,6 +143,7 @@ static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
 static UINT64 g_total_bytes = 0;
 static int g_feature_style = -999;
 static int g_feature_preset = -999;
+static int g_feature_ui_correction = -999;
 // Channel-order verdict is stable per feature build: -1 unknown, 0 RGBA, 1 BGRA.
 static int g_slots_are_bgra_cache = -1;
 
@@ -153,6 +154,10 @@ static int g_slots_are_bgra_cache = -1;
 // textures that D3D12/NGX can consume directly. No pixel ever crosses the CPU.
 static bool g_gpu_mode = false;
 static UINT g_shared_w = 0, g_shared_h = 0;
+// Per-stage timing, logged as running averages every N frames.
+static double g_ms_relay = 0.0, g_ms_eval = 0.0, g_ms_publish = 0.0;
+static uint32_t g_ms_frames = 0;
+static LARGE_INTEGER g_qpc_freq{};
 static ComPtr<ID3D11Device> g_helper_device;
 static ComPtr<ID3D11DeviceContext> g_helper_ctx;
 static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
@@ -531,6 +536,7 @@ static void ReleaseFeatureAndResources()
 	g_total_bytes = 0;
 	g_feature_style = -999;
 	g_feature_preset = -999;
+	g_feature_ui_correction = -999;
 }
 
 static bool AllocateFrameResources(UINT w, UINT h)
@@ -594,8 +600,12 @@ static void SetCommonParams(int style, int preset, float intensity, float tone, 
 static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity, float tone, float structure,
 			  float skin, int automask, int ui_correction)
 {
+	// Style, preset and UI correction are latched by the model at feature
+	// creation; changing them requires a rebuild (which also resets the
+	// temporal history). Intensity/tone/structure/skin/mask are per-frame.
 	const bool rebuild = !g_feature || (!g_gpu_mode && (w != g_width || h != g_height)) ||
-			     style != g_feature_style || preset != g_feature_preset;
+			     style != g_feature_style || preset != g_feature_preset ||
+			     ui_correction != g_feature_ui_correction;
 	if (!rebuild) {
 		SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 0);
 		return true;
@@ -627,6 +637,7 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 	}
 	g_feature_style = style;
 	g_feature_preset = preset;
+	g_feature_ui_correction = ui_correction;
 	return true;
 }
 
@@ -1145,6 +1156,11 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 	// 1) Helper D3D11: copy the OBS-rendered frame into the D3D12-visible
 	// relay texture. The keyed mutex (when present) orders this against the
 	// OBS render; Flush() submits immediately.
+	LARGE_INTEGER t0{}, t1{}, t2{}, t3{};
+	if (!g_qpc_freq.QuadPart)
+		QueryPerformanceFrequency(&g_qpc_freq);
+	QueryPerformanceCounter(&t0);
+
 	if (g_obs_in_km) {
 		if (FAILED(g_obs_in_km->AcquireSync(0, 100))) {
 			SetError("process_gpu: timed out acquiring input mutex");
@@ -1155,6 +1171,7 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 	if (g_obs_in_km)
 		g_obs_in_km->ReleaseSync(0);
 	g_helper_ctx->Flush();
+	QueryPerformanceCounter(&t1);
 
 	// 2) D3D12: NGX consumes the relay input and writes the relay output.
 	// Opened cross-API resources start out in the COMMON state and decay
@@ -1180,10 +1197,26 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 	}
 	if (!ExecuteAndWait())
 		return false;
+	QueryPerformanceCounter(&t2);
 
 	// 3) Helper D3D11: publish the result to the OBS-visible output.
 	g_helper_ctx->CopyResource(g_obs_out.Get(), g_relay_out.Get());
 	g_helper_ctx->Flush();
+	QueryPerformanceCounter(&t3);
+
+	// Running-average timings (EMA), logged every 300 frames.
+	const double relay_ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / g_qpc_freq.QuadPart;
+	const double eval_ms = (t2.QuadPart - t1.QuadPart) * 1000.0 / g_qpc_freq.QuadPart;
+	const double pub_ms = (t3.QuadPart - t2.QuadPart) * 1000.0 / g_qpc_freq.QuadPart;
+	g_ms_relay = g_ms_relay * 0.95 + relay_ms * 0.05;
+	g_ms_eval = g_ms_eval * 0.95 + eval_ms * 0.05;
+	g_ms_publish = g_ms_publish * 0.95 + pub_ms * 0.05;
+	if (++g_ms_frames >= 300) {
+		blog(LOG_INFO,
+		     "[obs-dlss5-nr] gpu timing avg over %u frames: relay %.2f ms, NR eval %.2f ms, publish %.2f ms (total %.2f ms)",
+		     g_ms_frames, g_ms_relay, g_ms_eval, g_ms_publish, g_ms_relay + g_ms_eval + g_ms_publish);
+		g_ms_frames = 0;
+	}
 	return true;
 }
 
