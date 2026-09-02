@@ -1,59 +1,35 @@
-# OBS Plugin Template
+# obs-dlss5-nr
 
-## Introduction
+**Unofficial DLSS 5 Neural Rendering filter for OBS Studio** — runs NVIDIA DLSS 5 NR (NGX feature 18) on any video source (Game Capture, Media Source, Webcam, …) with a **Default / Natural / Cinematic** style selector.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+> ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
+> This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+## Status — Phase 1
 
-## Supported Build Environments
+- [x] Plugin skeleton from obs-plugintemplate, renamed `obs-dlss5-nr`
+- [x] Pass-through video filter (copies input → output unchanged)
+- [x] Full properties UI: Style (Default/Natural/Cinematic), Render Preset, Intensity, Local Tone, Local Structure, Skin, Auto Mask, UI Correction, GPU Index, Channel Order, Reset History
+- [ ] **Phase 2** — D3D12 + NGX bridge (`nvngx_dlssnr`, feature 18), CPU-staged frame processing
+- [ ] **Phase 3** — release packaging + runtime DLL install instructions
+- [ ] **Phase 4** — zero-copy D3D11↔D3D12 interop, optical-flow motion vectors
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+## Requirements (end users)
 
-## Quick Start
+- Windows 10/11 x64, NVIDIA RTX GPU, recent driver
+- A **legally obtained** `nvngx_dlssnr.dll` placed in the plugin's `data/runtime/` folder (Phase 3). **This project never redistributes NVIDIA binaries.**
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+## Building
 
-## Documentation
+Same toolchain as [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate): Visual Studio 2022, CMake ≥ 3.28, Ninja.
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+```powershell
+cmake --preset windows-x64
+cmake --build build-x64 --config Release
+```
 
-Suggested reading to get up and running:
+Non-Windows platforms build an empty module (the filter only registers on `_WIN32`).
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+## License
 
-## GitHub Actions & CI
-
-Default GitHub Actions workflows are available for the following repository actions:
-
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
-
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
-
-### Retrieving build artifacts
-
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
-
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+GPL-2.0 (see `LICENSE`). Phase 2 will vendor MIT-licensed bridge code from [lisitskyaa/ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR) — see `THIRD_PARTY_NOTICES.md`.

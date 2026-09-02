@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "com.saganaki22.obs-dlss5-nr"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
+    "name": "obs-dlss5-nr",
+    "displayName": "DLSS 5 Neural Rendering",
+    "version": "0.1.0",
+    "author": "Saganaki22",
+    "website": "https://github.com/Saganaki22/obs-dlss5-nr",
     "email": "me@example.com"
 }
