@@ -23,9 +23,12 @@
 #include <util/platform.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "bridge/nr_bridge.h"
@@ -79,6 +82,30 @@ struct dlss5nr_filter {
 	bool using_gpu = false;
 	bool gpu_broken = false;    // set when shared-texture setup fails; avoid per-frame retry
 	bool gpu_zero_copy = false; // user opt-in; experimental
+	bool async_mode = true;     // "Smooth": NR on worker thread, +1 frame latency
+
+	// Async machinery (Smooth mode). The graphics thread only snapshots
+	// frames into jobs and draws the newest completed result; a worker
+	// thread runs the bridge.
+	struct AsyncJob {
+		std::vector<uint8_t> pixels;
+		uint32_t pitch = 0;
+		uint32_t w = 0, h = 0;
+		uint64_t seq = 0;
+		NrBridgeParams params{};
+	};
+	bool worker_started = false;
+	std::thread worker;
+	std::mutex job_mutex;
+	std::condition_variable job_cv;
+	std::deque<AsyncJob> jobs; // bounded; newest wins
+	std::mutex result_mutex;
+	AsyncJob result;
+	bool result_valid = false;
+	std::atomic<bool> stop_flag{false};
+	uint64_t submit_seq = 0;
+	uint64_t drawn_seq = 0;
+	std::vector<uint8_t> draw_buf;
 
 	// CPU staging fallback surfaces.
 	gs_texrender_t *texrender = nullptr;
@@ -99,6 +126,59 @@ struct dlss5nr_filter {
 };
 
 static std::atomic<int> g_bridge_users{0};
+
+// ------------------------------------------------------------ async worker
+
+static void async_worker(dlss5nr_filter *f)
+{
+	while (!f->stop_flag.load()) {
+		dlss5nr_filter::AsyncJob job;
+		{
+			std::unique_lock<std::mutex> lock(f->job_mutex);
+			f->job_cv.wait_for(lock, std::chrono::milliseconds(100),
+					   [&] { return f->stop_flag.load() || !f->jobs.empty(); });
+			if (f->stop_flag.load())
+				break;
+			if (f->jobs.empty())
+				continue;
+			job = std::move(f->jobs.back());
+			f->jobs.clear(); // stale frames dropped — newest wins
+		}
+
+		std::vector<uint8_t> out((size_t)job.w * job.h * 4);
+		const bool ok = nrbridge::process(job.pixels.data(), (int)job.pitch, out.data(), (int)job.w * 4,
+						  (int)job.w, (int)job.h, job.params);
+
+		std::lock_guard<std::mutex> lock(f->result_mutex);
+		if (ok) {
+			f->result.pixels = std::move(out);
+			f->result.w = job.w;
+			f->result.h = job.h;
+			f->result.seq = job.seq;
+			f->result_valid = true;
+		}
+	}
+}
+
+static void start_worker(dlss5nr_filter *f)
+{
+	if (f->worker_started)
+		return;
+	f->stop_flag.store(false);
+	f->worker = std::thread(async_worker, f);
+	f->worker_started = true;
+}
+
+static void stop_worker(dlss5nr_filter *f)
+{
+	if (!f->worker_started)
+		return;
+	f->stop_flag.store(true);
+	f->job_cv.notify_all();
+	if (f->worker.joinable())
+		f->worker.join();
+	f->worker_started = false;
+}
 
 // ---------------------------------------------------------------- lifecycle
 
@@ -129,6 +209,8 @@ static void dlss5nr_destroy(void *data)
 	auto *f = static_cast<dlss5nr_filter *>(data);
 	if (!f)
 		return;
+
+	stop_worker(f);
 
 	obs_enter_graphics();
 	if (f->shared_in_km) {
@@ -528,6 +610,92 @@ static bool process_cpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 	return true;
 }
 
+// Smooth mode: snapshot this frame into a job, then draw the newest
+// completed result (or pass through until the first result exists).
+static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx, uint32_t cy)
+{
+	UNUSED_PARAMETER(context);
+	if (!f->texrender)
+		return false;
+	if (!ensure_cpu_surfaces(f, cx, cy))
+		return false;
+
+	// Grab the parent's rendered frame.
+	gs_texrender_reset(f->texrender);
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+
+	bool grabbed = false;
+	if (gs_texrender_begin(f->texrender, cx, cy)) {
+		gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+		obs_source_video_render(parent);
+		gs_texrender_end(f->texrender);
+		grabbed = true;
+	}
+	gs_blend_state_pop();
+	if (!grabbed)
+		return false;
+
+	gs_texture_t *src_tex = gs_texrender_get_texture(f->texrender);
+	if (!src_tex)
+		return false;
+
+	gs_stage_texture(f->stagesurface, src_tex);
+	uint8_t *mapped = nullptr;
+	uint32_t pitch = 0;
+	if (!gs_stagesurface_map(f->stagesurface, &mapped, &pitch))
+		return false;
+
+	// Snapshot into a job; drop the oldest if the queue is full.
+	dlss5nr_filter::AsyncJob job;
+	job.pitch = pitch;
+	job.w = cx;
+	job.h = cy;
+	job.seq = ++f->submit_seq;
+	job.params.style = f->style;
+	job.params.preset = f->preset;
+	job.params.intensity = f->intensity;
+	job.params.tone = f->tone;
+	job.params.structure = f->structure;
+	job.params.skin = f->skin;
+	job.params.automask = f->automask ? 1 : 0;
+	job.params.ui_correction = f->ui_correction;
+	job.params.reset = f->reset_pending ? 1 : 0;
+	f->reset_pending = false;
+
+	job.pixels.resize((size_t)pitch * cy);
+	memcpy(job.pixels.data(), mapped, (size_t)pitch * cy);
+	gs_stagesurface_unmap(f->stagesurface);
+
+	{
+		std::lock_guard<std::mutex> lock(f->job_mutex);
+		if (f->jobs.size() >= 2)
+			f->jobs.pop_front();
+		f->jobs.push_back(std::move(job));
+	}
+	f->job_cv.notify_one();
+
+	// Draw the newest completed result; keep drawing it while a newer one
+	// is in flight so the output never flickers between NR and raw.
+	bool new_result = false;
+	{
+		std::lock_guard<std::mutex> lock(f->result_mutex);
+		if (f->result_valid && f->result.seq != f->drawn_seq && f->result.w == cx && f->result.h == cy) {
+			std::swap(f->draw_buf, f->result.pixels);
+			f->drawn_seq = f->result.seq;
+			new_result = true;
+		}
+	}
+
+	if (f->drawn_seq == 0)
+		return false; // nothing processed yet — brief pass-through at start
+
+	if (new_result)
+		gs_texture_set_image(f->out_tex, f->draw_buf.data(), cx * 4, false);
+	draw_texture(f->out_tex, cx, cy);
+	return true;
+}
+
 static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 {
 	UNUSED_PARAMETER(filter_effect);
@@ -545,20 +713,28 @@ static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 	const bool bridge_ready = ensure_bridge_ready(f);
 	bool processed = false;
 
-	if (bridge_ready && f->gpu_zero_copy && gs_shared_texture_available()) {
-		switch (process_gpu_path(f, parent, context, cx, cy)) {
-		case GpuResult::Ok:
-			processed = true;
-			break;
-		case GpuResult::Skip:
-			break; // pass through this frame; GPU mode stays attached
-		case GpuResult::Broken:
-			// Surfaces are detached now; CPU staging is safe again.
+	if (bridge_ready) {
+		if (f->async_mode) {
+			// Smooth mode: worker thread owns the bridge. The
+			// experimental zero-copy path is incompatible with it
+			// (mutually exclusive bridge modes).
+			start_worker(f);
+			processed = process_async_path(f, parent, context, cx, cy);
+		} else if (f->gpu_zero_copy && gs_shared_texture_available()) {
+			switch (process_gpu_path(f, parent, context, cx, cy)) {
+			case GpuResult::Ok:
+				processed = true;
+				break;
+			case GpuResult::Skip:
+				break; // pass through this frame; GPU mode stays attached
+			case GpuResult::Broken:
+				// Surfaces are detached now; CPU staging is safe again.
+				processed = process_cpu_path(f, parent, context, cx, cy);
+				break;
+			}
+		} else {
 			processed = process_cpu_path(f, parent, context, cx, cy);
-			break;
 		}
-	} else if (bridge_ready) {
-		processed = process_cpu_path(f, parent, context, cx, cy);
 	}
 
 	if (!processed) {
@@ -590,6 +766,10 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	f->ui_correction = 0;
 	f->gpu_index = (int)obs_data_get_int(settings, "gpu_index");
 	f->channel_order = (int)obs_data_get_int(settings, "channel_order");
+	const bool new_async = obs_data_get_bool(settings, "async_mode");
+	if (f->initialized && f->async_mode && !new_async)
+		stop_worker(f); // realtime mode takes over the bridge directly
+	f->async_mode = new_async;
 	f->gpu_zero_copy = obs_data_get_bool(settings, "gpu_zero_copy");
 	if (!f->gpu_zero_copy && f->using_gpu) {
 		destroy_gpu_surfaces(f);
@@ -657,6 +837,12 @@ static obs_properties_t *dlss5nr_properties(void *data)
 
 	obs_properties_add_group(props, "advanced", obs_module_text("Advanced"), OBS_GROUP_NORMAL, advanced);
 
+	obs_property_t *mode = obs_properties_add_list(props, "async_mode", obs_module_text("ProcessingMode"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_BOOL);
+	obs_property_list_add_bool(mode, obs_module_text("ProcessingMode.Smooth"), true);
+	obs_property_list_add_bool(mode, obs_module_text("ProcessingMode.Realtime"), false);
+	obs_property_set_long_description(mode, obs_module_text("ProcessingMode.Tip"));
+
 	obs_properties_add_button(props, "reset_history", obs_module_text("ResetHistory.Button"),
 				  dlss5nr_reset_history_cb);
 
@@ -674,6 +860,7 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "automask", false);
 	obs_data_set_default_int(settings, "gpu_index", 0);
 	obs_data_set_default_bool(settings, "gpu_zero_copy", false);
+	obs_data_set_default_bool(settings, "async_mode", true);
 	obs_data_set_default_int(settings, "channel_order", DLSSNR_CHANNEL_AUTO);
 	obs_data_set_default_string(settings, "status", "");
 }
