@@ -254,6 +254,17 @@ static void log_error_throttled(dlss5nr_filter *f, const char *err)
 	blog(LOG_WARNING, "[obs-dlss5-nr] NR processing failed, passing through: %s", err);
 }
 
+static void log_state_throttled(dlss5nr_filter *f, const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	f->set_status("%s", buf);
+	log_error_throttled(f, buf);
+}
+
 // ---------------------------------------------------------------- rendering
 
 static void destroy_cpu_surfaces(dlss5nr_filter *f)
@@ -302,6 +313,10 @@ static bool ensure_gpu_surfaces(dlss5nr_filter *f, uint32_t cx, uint32_t cy)
 		if (auto *obj = gs_texture_get_obj(f->shared_in)) {
 			static_cast<ID3D11Texture2D *>(obj)->QueryInterface(IID_PPV_ARGS(&f->shared_in_km));
 		}
+		// A keyed mutex starts out owned by its creating device; hand
+		// ownership over so the bridge side can acquire it.
+		if (f->shared_in_km)
+			f->shared_in_km->ReleaseSync(0);
 	}
 	obs_leave_graphics();
 
@@ -332,6 +347,8 @@ static bool ensure_gpu_surfaces(dlss5nr_filter *f, uint32_t cx, uint32_t cy)
 	f->shared_w = cx;
 	f->shared_h = cy;
 	f->using_gpu = true;
+	blog(LOG_INFO, "[obs-dlss5-nr] GPU surfaces attached at %ux%u (shared_in=%p, out_handle=%u)", (int)cx, (int)cy,
+	     (void *)f->shared_in, out_handle);
 	return true;
 }
 
@@ -404,7 +421,8 @@ static GpuResult process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_s
 
 	if (f->shared_in_km) {
 		if (FAILED(f->shared_in_km->AcquireSync(0, KM_TIMEOUT_MS))) {
-			f->set_status("Input texture busy — passing through this frame");
+			log_state_throttled(f, "OBS-side AcquireSync timed out (%lu) — passing through this frame",
+					    (unsigned long)GetLastError());
 			return GpuResult::Skip;
 		}
 	}
