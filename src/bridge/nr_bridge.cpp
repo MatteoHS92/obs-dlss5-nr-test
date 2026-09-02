@@ -161,13 +161,13 @@ static LARGE_INTEGER g_qpc_freq{};
 static std::string g_timing_text;
 static ComPtr<ID3D11Device> g_helper_device;
 static ComPtr<ID3D11DeviceContext> g_helper_ctx;
-	static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
-	static IDXGIKeyedMutex *g_obs_in_km = nullptr;
-	static ComPtr<ID3D11Texture2D> g_relay_in;  // NTHANDLE shared, opened in D3D12
-	static ComPtr<ID3D11Texture2D> g_relay_out; // NTHANDLE shared, written by NGX
-	static IDXGIKeyedMutex *g_relay_in_km = nullptr;
-	static IDXGIKeyedMutex *g_relay_out_km = nullptr;
-	static ComPtr<ID3D11Texture2D> g_obs_out; // legacy shared, drawn by OBS
+static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
+static IDXGIKeyedMutex *g_obs_in_km = nullptr;
+static ComPtr<ID3D11Texture2D> g_relay_in;  // NTHANDLE shared, opened in D3D12
+static ComPtr<ID3D11Texture2D> g_relay_out; // NTHANDLE shared, written by NGX
+static IDXGIKeyedMutex *g_relay_in_km = nullptr;
+static IDXGIKeyedMutex *g_relay_out_km = nullptr;
+static ComPtr<ID3D11Texture2D> g_obs_out; // legacy shared, drawn by OBS
 static HANDLE g_relay_in_nt = nullptr;
 static HANDLE g_relay_out_nt = nullptr;
 static ComPtr<ID3D12Resource> g_shared_color;  // = g_relay_in in D3D12
@@ -1030,9 +1030,8 @@ bool attach_shared(uint32_t in_handle, uint32_t width, uint32_t height, uint32_t
 	}
 	// NTHANDLE sharing requires an explicit D3D11.1 feature level request.
 	static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-	HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels,
-				       ARRAYSIZE(levels), D3D11_SDK_VERSION,
-				       g_helper_device.ReleaseAndGetAddressOf(), nullptr,
+	HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels, ARRAYSIZE(levels),
+				       D3D11_SDK_VERSION, g_helper_device.ReleaseAndGetAddressOf(), nullptr,
 				       g_helper_ctx.ReleaseAndGetAddressOf());
 	if (FAILED(hr)) {
 		SetError("attach_shared: helper D3D11 device creation failed: 0x%08lX", (unsigned long)hr);
