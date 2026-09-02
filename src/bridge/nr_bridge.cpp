@@ -161,11 +161,13 @@ static LARGE_INTEGER g_qpc_freq{};
 static std::string g_timing_text;
 static ComPtr<ID3D11Device> g_helper_device;
 static ComPtr<ID3D11DeviceContext> g_helper_ctx;
-static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
-static IDXGIKeyedMutex *g_obs_in_km = nullptr;
-static ComPtr<ID3D11Texture2D> g_relay_in;  // NTHANDLE shared, opened in D3D12
-static ComPtr<ID3D11Texture2D> g_relay_out; // NTHANDLE shared, written by NGX
-static ComPtr<ID3D11Texture2D> g_obs_out;   // legacy shared, drawn by OBS
+	static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
+	static IDXGIKeyedMutex *g_obs_in_km = nullptr;
+	static ComPtr<ID3D11Texture2D> g_relay_in;  // NTHANDLE shared, opened in D3D12
+	static ComPtr<ID3D11Texture2D> g_relay_out; // NTHANDLE shared, written by NGX
+	static IDXGIKeyedMutex *g_relay_in_km = nullptr;
+	static IDXGIKeyedMutex *g_relay_out_km = nullptr;
+	static ComPtr<ID3D11Texture2D> g_obs_out; // legacy shared, drawn by OBS
 static HANDLE g_relay_in_nt = nullptr;
 static HANDLE g_relay_out_nt = nullptr;
 static ComPtr<ID3D12Resource> g_shared_color;  // = g_relay_in in D3D12
@@ -196,6 +198,14 @@ static void ReleaseSharedState()
 	if (g_obs_in_km) {
 		g_obs_in_km->Release();
 		g_obs_in_km = nullptr;
+	}
+	if (g_relay_in_km) {
+		g_relay_in_km->Release();
+		g_relay_in_km = nullptr;
+	}
+	if (g_relay_out_km) {
+		g_relay_out_km->Release();
+		g_relay_out_km = nullptr;
 	}
 	g_obs_in.Reset();
 	g_relay_in.Reset();
@@ -1018,8 +1028,11 @@ bool attach_shared(uint32_t in_handle, uint32_t width, uint32_t height, uint32_t
 		SetError("attach_shared: NVIDIA adapter not found");
 		return false;
 	}
-	HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
-				       D3D11_SDK_VERSION, g_helper_device.ReleaseAndGetAddressOf(), nullptr,
+	// NTHANDLE sharing requires an explicit D3D11.1 feature level request.
+	static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+	HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels,
+				       ARRAYSIZE(levels), D3D11_SDK_VERSION,
+				       g_helper_device.ReleaseAndGetAddressOf(), nullptr,
 				       g_helper_ctx.ReleaseAndGetAddressOf());
 	if (FAILED(hr)) {
 		SetError("attach_shared: helper D3D11 device creation failed: 0x%08lX", (unsigned long)hr);
@@ -1045,18 +1058,21 @@ bool attach_shared(uint32_t in_handle, uint32_t width, uint32_t height, uint32_t
 	relay.SampleDesc.Count = 1;
 	relay.Usage = D3D11_USAGE_DEFAULT;
 	relay.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-	relay.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	// NTHANDLE sharing is only valid together with the keyed mutex.
+	relay.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
 	hr = g_helper_device->CreateTexture2D(&relay, nullptr, &g_relay_in);
 	if (FAILED(hr)) {
 		SetError("attach_shared: relay input creation failed: 0x%08lX", (unsigned long)hr);
 		return false;
 	}
+	g_relay_in->QueryInterface(IID_PPV_ARGS(&g_relay_in_km));
 	hr = g_helper_device->CreateTexture2D(&relay, nullptr, &g_relay_out);
 	if (FAILED(hr)) {
 		SetError("attach_shared: relay output creation failed: 0x%08lX", (unsigned long)hr);
 		return false;
 	}
+	g_relay_out->QueryInterface(IID_PPV_ARGS(&g_relay_out_km));
 
 	// NTHANDLE shared handles for the D3D12 side.
 	ComPtr<IDXGIResource1> res1;

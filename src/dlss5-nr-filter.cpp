@@ -545,7 +545,10 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	f->structure = (float)obs_data_get_double(settings, "structure");
 	f->skin = (float)obs_data_get_double(settings, "skin");
 	f->automask = obs_data_get_bool(settings, "automask");
-	f->ui_correction = (int)obs_data_get_int(settings, "ui_correction");
+	// DLSSNR.UICorrection is left disabled (0): the runtime renders black
+	// with correction enabled unless UI-detection inputs are provided, and
+	// the reference integrations hardcode it off.
+	f->ui_correction = 0;
 	f->gpu_index = (int)obs_data_get_int(settings, "gpu_index");
 	f->channel_order = (int)obs_data_get_int(settings, "channel_order");
 	f->initialized = true;
@@ -596,12 +599,7 @@ static obs_properties_t *dlss5nr_properties(void *data)
 	obs_properties_add_float_slider(props, "structure", obs_module_text("LocalStructure"), 0.0, 2.0, 0.05);
 	obs_properties_add_float_slider(props, "skin", obs_module_text("Skin"), -1.0, 2.0, 0.05);
 	obs_properties_add_bool(props, "automask", obs_module_text("AutoMask"));
-
 	obs_properties_t *advanced = obs_properties_create();
-	obs_property_t *ui_corr = obs_properties_add_list(advanced, "ui_correction", obs_module_text("UICorrection"),
-							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(ui_corr, obs_module_text("UICorrection.Off"), 0);
-	obs_property_list_add_int(ui_corr, obs_module_text("UICorrection.On"), 1);
 
 	obs_properties_add_int(advanced, "gpu_index", obs_module_text("GPUIndex"), 0, 15, 1);
 
@@ -628,7 +626,6 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "structure", 1.0);
 	obs_data_set_default_double(settings, "skin", -1.0);
 	obs_data_set_default_bool(settings, "automask", false);
-	obs_data_set_default_int(settings, "ui_correction", 0);
 	obs_data_set_default_int(settings, "gpu_index", 0);
 	obs_data_set_default_int(settings, "channel_order", DLSSNR_CHANNEL_AUTO);
 	obs_data_set_default_string(settings, "status", "");
