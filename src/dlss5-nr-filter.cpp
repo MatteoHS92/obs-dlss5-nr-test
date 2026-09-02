@@ -425,6 +425,16 @@ static bool process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 		return false;
 	}
 
+	// The bridge refreshes this every 300 frames; log it when it changes.
+	const char *tt = nrbridge::timing_text();
+	if (*tt) {
+		static std::string s_last_timing;
+		if (s_last_timing != tt) {
+			s_last_timing = tt;
+			blog(LOG_INFO, "[obs-dlss5-nr] %s", tt);
+		}
+	}
+
 	draw_texture(f->shared_out, cx, cy);
 	return true;
 }

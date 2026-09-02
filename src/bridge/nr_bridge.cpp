@@ -158,6 +158,7 @@ static UINT g_shared_w = 0, g_shared_h = 0;
 static double g_ms_relay = 0.0, g_ms_eval = 0.0, g_ms_publish = 0.0;
 static uint32_t g_ms_frames = 0;
 static LARGE_INTEGER g_qpc_freq{};
+static std::string g_timing_text;
 static ComPtr<ID3D11Device> g_helper_device;
 static ComPtr<ID3D11DeviceContext> g_helper_ctx;
 static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
@@ -1212,9 +1213,11 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 	g_ms_eval = g_ms_eval * 0.95 + eval_ms * 0.05;
 	g_ms_publish = g_ms_publish * 0.95 + pub_ms * 0.05;
 	if (++g_ms_frames >= 300) {
-		blog(LOG_INFO,
-		     "[obs-dlss5-nr] gpu timing avg over %u frames: relay %.2f ms, NR eval %.2f ms, publish %.2f ms (total %.2f ms)",
-		     g_ms_frames, g_ms_relay, g_ms_eval, g_ms_publish, g_ms_relay + g_ms_eval + g_ms_publish);
+		char buf[256];
+		snprintf(buf, sizeof(buf),
+			 "GPU avg/%u frames: relay %.2f ms, NR eval %.2f ms, publish %.2f ms (total %.2f ms)",
+			 g_ms_frames, g_ms_relay, g_ms_eval, g_ms_publish, g_ms_relay + g_ms_eval + g_ms_publish);
+		g_timing_text = buf;
 		g_ms_frames = 0;
 	}
 	return true;
@@ -1242,6 +1245,12 @@ const char *last_error()
 {
 	std::lock_guard<std::mutex> guard(g_mutex);
 	return g_last_error.c_str();
+}
+
+const char *timing_text()
+{
+	std::lock_guard<std::mutex> guard(g_mutex);
+	return g_timing_text.c_str();
 }
 
 } // namespace nrbridge

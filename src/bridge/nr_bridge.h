@@ -48,5 +48,6 @@ void shutdown();
 bool ready();
 const char *gpu_name();
 const char *last_error();
+const char *timing_text();
 
 } // namespace nrbridge
