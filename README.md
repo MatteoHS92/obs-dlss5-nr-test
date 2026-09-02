@@ -41,6 +41,7 @@ For legal reasons this project cannot provide, link, or mirror that file. Places
 
 - **Your own install of a game that ships DLSS 5 NR** — e.g. copy `nvngx_dlssnr.dll` out of the **NBA 2K27** game folder
 - The **NVIDIA DLSS SDK**, if a release includes the NR runtime
+- Community tools that bundle the runtime, e.g. **[DLSS5-Swapper](https://github.com/rakanki911/DLSS5-Swapper)** (its bundled 310.8 build is the same file most of the community ships)
 
 Everything else is handled for you: the NGX core (`_nvngx.dll`) is discovered automatically inside your installed NVIDIA driver, and no other file from game/SDK folders is needed.
 
@@ -82,14 +83,17 @@ The NGX core (`_nvngx.dll`) is not copied by hand — the plugin discovers it au
 
 DLSS NR support is decided by the `nvngx_dlssnr.dll` build you supply — the plugin relays the runtime's verdict to the Status line and falls back to clean pass-through video when a GPU is rejected.
 
+The community-standard **310.8 runtime** (the build everyone ships, including the DLSS5-Swapper project) reports support across the full RTX lineup:
+
 | GPU | Status |
 |---|---|
-| RTX 50xx | Expected to work with runtime builds targeting DLSS 5 |
-| RTX 40xx | Works with runtime builds patched for Ada |
-| RTX 30xx | Unverified — the runtime may reject it |
+| RTX 50xx | ✅ Verified (development and testing happen on a 5090) |
+| RTX 40xx | Reported working with the standard 310.8 runtime |
+| RTX 30xx | Reported working with the standard 310.8 runtime |
+| RTX 20xx | Reported working with the standard 310.8 runtime |
 | Older / non-RTX / AMD / Intel | Not supported |
 
-If the Status line shows `0xBAD00001`, your runtime build does not support your GPU/driver combination.
+"Reported" = per the community projects that ship this runtime; we've only verified 50-series ourselves. If the Status line shows `0xBAD00001`, your runtime build does not support your GPU/driver combination — try a different build.
 
 ## Building from source
 
