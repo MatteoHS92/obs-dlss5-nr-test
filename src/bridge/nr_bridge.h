@@ -28,9 +28,21 @@ namespace nrbridge {
 // shim_dir: directory containing nvngx.dll_obs.dll (UTF-16); may be null.
 bool init(int gpu_index, const wchar_t *runtime_dir, const wchar_t *shim_dir);
 
-// src_bgra/dst_bgra: 8-bit BGRA rows; pitches in bytes.
+// Zero-copy mode: in_handle is a legacy keyed-mutex-shared D3D11 texture
+// (RGBA16F, render-target capable) owned by OBS; out_handle receives the
+// legacy shared handle of a matching output texture the OBS side can draw.
+// On success process_gpu() runs the whole pipeline on the GPU.
+bool attach_shared(uint32_t in_handle, uint32_t width, uint32_t height, uint32_t *out_handle);
+bool gpu_mode();
+void detach_shared();
+
+// src_bgra/dst_bgra: 8-bit BGRA rows; pitches in bytes. (CPU fallback path.)
 bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int dst_row_pitch, int width, int height,
 	     const NrBridgeParams &params);
+
+// Zero-copy path: caller has already rendered the frame into the attached
+// input texture. Blocks until the GPU finished writing the output texture.
+bool process_gpu(int width, int height, const NrBridgeParams &params);
 
 void shutdown();
 bool ready();

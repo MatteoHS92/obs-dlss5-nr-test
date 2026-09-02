@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <dxgi1_2.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
@@ -142,6 +143,73 @@ static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
 static UINT64 g_total_bytes = 0;
 static int g_feature_style = -999;
 static int g_feature_preset = -999;
+// Channel-order verdict is stable per feature build: -1 unknown, 0 RGBA, 1 BGRA.
+static int g_slots_are_bgra_cache = -1;
+
+// ---- zero-copy interop state -------------------------------------------
+// OBS side owns two legacy-shared D3D11 textures it cannot open in D3D12
+// itself (libobs uses legacy DXGI sharing). A helper D3D11 device on the same
+// GPU relays pixels between the OBS-visible textures and NTHANDLE-shared
+// textures that D3D12/NGX can consume directly. No pixel ever crosses the CPU.
+static bool g_gpu_mode = false;
+static UINT g_shared_w = 0, g_shared_h = 0;
+static ComPtr<ID3D11Device> g_helper_device;
+static ComPtr<ID3D11DeviceContext> g_helper_ctx;
+static ComPtr<ID3D11Texture2D> g_obs_in; // opened view of the OBS input texture
+static IDXGIKeyedMutex *g_obs_in_km = nullptr;
+static ComPtr<ID3D11Texture2D> g_relay_in;  // NTHANDLE shared, opened in D3D12
+static ComPtr<ID3D11Texture2D> g_relay_out; // NTHANDLE shared, written by NGX
+static ComPtr<ID3D11Texture2D> g_obs_out;   // legacy shared, drawn by OBS
+static HANDLE g_relay_in_nt = nullptr;
+static HANDLE g_relay_out_nt = nullptr;
+static ComPtr<ID3D12Resource> g_shared_color;  // = g_relay_in in D3D12
+static ComPtr<ID3D12Resource> g_shared_output; // = g_relay_out in D3D12
+
+static ComPtr<IDXGIAdapter1> FindAdapter(int nvidia_index)
+{
+	ComPtr<IDXGIFactory4> factory;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+		return nullptr;
+	int seen = 0;
+	for (UINT i = 0;; ++i) {
+		ComPtr<IDXGIAdapter1> adapter;
+		if (factory->EnumAdapters1(i, &adapter) == DXGI_ERROR_NOT_FOUND)
+			break;
+		DXGI_ADAPTER_DESC1 desc{};
+		adapter->GetDesc1(&desc);
+		if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || desc.VendorId != 0x10DE)
+			continue;
+		if (seen++ == nvidia_index)
+			return adapter;
+	}
+	return nullptr;
+}
+
+static void ReleaseSharedState()
+{
+	if (g_obs_in_km) {
+		g_obs_in_km->Release();
+		g_obs_in_km = nullptr;
+	}
+	g_obs_in.Reset();
+	g_relay_in.Reset();
+	g_relay_out.Reset();
+	g_obs_out.Reset();
+	g_shared_color.Reset();
+	g_shared_output.Reset();
+	if (g_relay_in_nt) {
+		CloseHandle(g_relay_in_nt);
+		g_relay_in_nt = nullptr;
+	}
+	if (g_relay_out_nt) {
+		CloseHandle(g_relay_out_nt);
+		g_relay_out_nt = nullptr;
+	}
+	g_helper_ctx.Reset();
+	g_helper_device.Reset();
+	g_shared_w = g_shared_h = 0;
+	g_gpu_mode = false;
+}
 
 static void SetError(const char *fmt, ...)
 {
@@ -413,6 +481,10 @@ static uint16_t FloatToHalf(float f)
 	return static_cast<uint16_t>(s | (static_cast<uint32_t>(e) << 10) | (m >> 13));
 }
 
+// 8-bit -> half conversion is exact and range-limited: precompute it.
+static uint16_t g_lut8_to_half[256];
+static bool g_lut8_ready = false;
+
 static float HalfToFloat(uint16_t h)
 {
 	uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff, x;
@@ -448,11 +520,14 @@ static void ReleaseFeatureAndResources()
 			g_core_release(g_feature);
 		g_feature = nullptr;
 	}
+	// In GPU mode the shared textures outlive feature rebuilds; only the
+	// CPU-staging resources are owned here.
 	g_color.Reset();
 	g_output.Reset();
 	g_upload.Reset();
 	g_readback.Reset();
-	g_width = g_height = g_row_pitch = 0;
+	if (!g_gpu_mode)
+		g_width = g_height = g_row_pitch = 0;
 	g_total_bytes = 0;
 	g_feature_style = -999;
 	g_feature_preset = -999;
@@ -485,6 +560,8 @@ static bool AllocateFrameResources(UINT w, UINT h)
 static void SetCommonParams(int style, int preset, float intensity, float tone, float structure, float skin,
 			    int automask, int ui_correction, int reset)
 {
+	ID3D12Resource *color = g_gpu_mode ? g_shared_color.Get() : g_color.Get();
+	ID3D12Resource *output = g_gpu_mode ? g_shared_output.Get() : g_output.Get();
 	g_params->Set("DLSSNR.Width", g_width);
 	g_params->Set("DLSSNR.Height", g_height);
 	g_params->Set("DLSSNR.Enabled", 1);
@@ -501,9 +578,9 @@ static void SetCommonParams(int style, int preset, float intensity, float tone, 
 	g_params->Set("DLSSNR.ScalingRatio", 1.0f);
 	g_params->Set("DLSSNR.MVecScaleX", 1.0f);
 	g_params->Set("DLSSNR.MVecScaleY", 1.0f);
-	g_params->Set("DLSSNR.Color", g_color.Get());
-	g_params->Set("DLSSNR.Output", g_output.Get());
-	g_params->Set("DLSSNR.Backbuffer", g_output.Get());
+	g_params->Set("DLSSNR.Color", color);
+	g_params->Set("DLSSNR.Output", output);
+	g_params->Set("DLSSNR.Backbuffer", output);
 	g_params->Set("DLSSNR.ColorSubrectBaseX", 0);
 	g_params->Set("DLSSNR.ColorSubrectBaseY", 0);
 	g_params->Set("DLSSNR.ColorSubrectWidth", g_width);
@@ -517,16 +594,21 @@ static void SetCommonParams(int style, int preset, float intensity, float tone, 
 static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity, float tone, float structure,
 			  float skin, int automask, int ui_correction)
 {
-	const bool rebuild = !g_feature || w != g_width || h != g_height || style != g_feature_style ||
-			     preset != g_feature_preset;
+	const bool rebuild = !g_feature || (!g_gpu_mode && (w != g_width || h != g_height)) ||
+			     style != g_feature_style || preset != g_feature_preset;
 	if (!rebuild) {
 		SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 0);
 		return true;
 	}
 
 	ReleaseFeatureAndResources();
-	if (!AllocateFrameResources(w, h))
-		return false;
+	if (!g_gpu_mode) {
+		if (!AllocateFrameResources(w, h))
+			return false;
+	} else {
+		g_width = g_shared_w;
+		g_height = g_shared_h;
+	}
 	// The runtime latches model parameters at creation; reset the temporal
 	// history on the first evaluated frame.
 	SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 1);
@@ -671,6 +753,7 @@ static bool InitNGXSession()
 static void ShutdownUnlocked()
 {
 	ReleaseFeatureAndResources();
+	ReleaseSharedState();
 	if (g_core_shutdown)
 		g_core_shutdown();
 	g_params = nullptr;
@@ -763,6 +846,12 @@ bool init(int gpu_index, const wchar_t *runtime_dir, const wchar_t *shim_dir)
 	g_runtime_dir = runtime_dir;
 	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
+	if (!g_lut8_ready) {
+		for (int i = 0; i < 256; ++i)
+			g_lut8_to_half[i] = FloatToHalf(i / 255.0f);
+		g_lut8_ready = true;
+	}
+
 	std::wstring shim_w = shim_dir ? std::wstring(shim_dir) : std::wstring();
 	if (!SetupD3D12() || !LoadNGX(shim_w) || !InitNGXSession()) {
 		ShutdownUnlocked();
@@ -798,23 +887,23 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 	SetCommonParams(params.style, params.preset, params.intensity, params.tone, params.structure, params.skin,
 			params.automask, params.ui_correction, params.reset ? 1 : 0);
 
-	// Pack BGRA8 input into the RGBA16F upload buffer.
+	// Pack BGRA8 input into the RGBA16F upload buffer. Row padding is never
+	// read by footprint copies, so it is left untouched.
 	void *mapped = nullptr;
 	HRESULT hr = g_upload->Map(0, nullptr, &mapped);
 	if (FAILED(hr) || !mapped) {
 		SetError("Upload buffer Map failed: 0x%08X", static_cast<unsigned>(hr));
 		return false;
 	}
-	memset(mapped, 0, static_cast<size_t>(g_total_bytes));
 	auto *dst_base = static_cast<uint8_t *>(mapped);
 	for (int y = 0; y < height; ++y) {
 		auto *row = reinterpret_cast<uint16_t *>(dst_base + (size_t)y * g_row_pitch);
 		const uint8_t *src = src_bgra + (size_t)y * src_row_pitch;
 		for (int x = 0; x < width; ++x) {
 			const uint8_t b = src[x * 4 + 0], g = src[x * 4 + 1], r = src[x * 4 + 2];
-			row[x * 4 + 0] = FloatToHalf(r / 255.0f);
-			row[x * 4 + 1] = FloatToHalf(g / 255.0f);
-			row[x * 4 + 2] = FloatToHalf(b / 255.0f);
+			row[x * 4 + 0] = g_lut8_to_half[r];
+			row[x * 4 + 1] = g_lut8_to_half[g];
+			row[x * 4 + 2] = g_lut8_to_half[b];
 			row[x * 4 + 3] = FloatToHalf(1.0f);
 		}
 	}
@@ -890,6 +979,211 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 		}
 	}
 	g_readback->Unmap(0, nullptr);
+	return true;
+}
+
+bool attach_shared(uint32_t in_handle, uint32_t width, uint32_t height, uint32_t *out_handle)
+{
+	std::lock_guard<std::mutex> guard(g_mutex);
+	g_last_error.clear();
+	if (!g_initialized) {
+		SetError("NR bridge is not initialized");
+		return false;
+	}
+	if (!out_handle || width == 0 || height == 0 || width > 16384 || height > 16384) {
+		SetError("attach_shared: invalid arguments");
+		return false;
+	}
+	if (g_gpu_mode && g_shared_w == width && g_shared_h == height) {
+		*out_handle = 0; // caller already has it
+		return true;
+	}
+
+	ReleaseSharedState();
+
+	ComPtr<IDXGIAdapter1> adapter = FindAdapter(g_gpu_index);
+	if (!adapter) {
+		SetError("attach_shared: NVIDIA adapter not found");
+		return false;
+	}
+	HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+				       D3D11_SDK_VERSION, g_helper_device.ReleaseAndGetAddressOf(), nullptr,
+				       g_helper_ctx.ReleaseAndGetAddressOf());
+	if (FAILED(hr)) {
+		SetError("attach_shared: helper D3D11 device creation failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+
+	// Open the OBS-side input texture (legacy keyed-mutex shared).
+	hr = g_helper_device->OpenSharedResource((HANDLE)(uintptr_t)in_handle, IID_PPV_ARGS(&g_obs_in));
+	if (FAILED(hr)) {
+		SetError("attach_shared: OpenSharedResource(input) failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	hr = g_obs_in->QueryInterface(IID_PPV_ARGS(&g_obs_in_km));
+	if (FAILED(hr))
+		g_obs_in_km = nullptr; // keyed mutex optional; CPU serialization still applies
+
+	D3D11_TEXTURE2D_DESC relay{};
+	relay.Width = width;
+	relay.Height = height;
+	relay.MipLevels = 1;
+	relay.ArraySize = 1;
+	relay.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	relay.SampleDesc.Count = 1;
+	relay.Usage = D3D11_USAGE_DEFAULT;
+	relay.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	relay.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+	hr = g_helper_device->CreateTexture2D(&relay, nullptr, &g_relay_in);
+	if (FAILED(hr)) {
+		SetError("attach_shared: relay input creation failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	hr = g_helper_device->CreateTexture2D(&relay, nullptr, &g_relay_out);
+	if (FAILED(hr)) {
+		SetError("attach_shared: relay output creation failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+
+	// NTHANDLE shared handles for the D3D12 side.
+	ComPtr<IDXGIResource1> res1;
+	HANDLE nt = nullptr;
+	hr = g_relay_in.As(&res1);
+	if (SUCCEEDED(hr))
+		hr = res1->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &nt);
+	if (FAILED(hr)) {
+		SetError("attach_shared: input CreateSharedHandle failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	g_relay_in_nt = nt;
+	res1.Reset();
+	nt = nullptr;
+	hr = g_relay_out.As(&res1);
+	if (SUCCEEDED(hr))
+		hr = res1->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &nt);
+	if (FAILED(hr)) {
+		SetError("attach_shared: output CreateSharedHandle failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	g_relay_out_nt = nt;
+	res1.Reset();
+
+	hr = g_device->OpenSharedHandle(g_relay_in_nt, IID_PPV_ARGS(&g_shared_color));
+	if (FAILED(hr)) {
+		SetError("attach_shared: D3D12 OpenSharedHandle(input) failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	hr = g_device->OpenSharedHandle(g_relay_out_nt, IID_PPV_ARGS(&g_shared_output));
+	if (FAILED(hr)) {
+		SetError("attach_shared: D3D12 OpenSharedHandle(output) failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+
+	// OBS-visible output: legacy shared so libobs can open it.
+	D3D11_TEXTURE2D_DESC outDesc = relay;
+	outDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+	hr = g_helper_device->CreateTexture2D(&outDesc, nullptr, &g_obs_out);
+	if (FAILED(hr)) {
+		SetError("attach_shared: output texture creation failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	ComPtr<IDXGIResource> dxgiRes;
+	hr = g_obs_out.As(&dxgiRes);
+	if (FAILED(hr)) {
+		SetError("attach_shared: output QI(IDXGIResource) failed");
+		return false;
+	}
+	HANDLE legacy = nullptr;
+	hr = dxgiRes->GetSharedHandle(&legacy);
+	if (FAILED(hr)) {
+		SetError("attach_shared: output GetSharedHandle failed: 0x%08lX", (unsigned long)hr);
+		return false;
+	}
+	*out_handle = (uint32_t)(uintptr_t)legacy;
+
+	g_shared_w = width;
+	g_shared_h = height;
+	g_gpu_mode = true;
+	return true;
+}
+
+bool gpu_mode()
+{
+	std::lock_guard<std::mutex> guard(g_mutex);
+	return g_gpu_mode;
+}
+
+void detach_shared()
+{
+	std::lock_guard<std::mutex> guard(g_mutex);
+	ReleaseFeatureAndResources();
+	ReleaseSharedState();
+}
+
+bool process_gpu(int width, int height, const NrBridgeParams &params)
+{
+	std::lock_guard<std::mutex> guard(g_mutex);
+	g_last_error.clear();
+	if (!g_initialized || !g_gpu_mode) {
+		SetError("GPU path not active");
+		return false;
+	}
+	if ((UINT)width != g_shared_w || (UINT)height != g_shared_h) {
+		SetError("process_gpu: size changed (%ux%u != %ux%u) — re-attach", width, height, g_shared_w,
+			 g_shared_h);
+		return false;
+	}
+
+	if (!EnsureFeature(g_shared_w, g_shared_h, params.style, params.preset, params.intensity, params.tone,
+			   params.structure, params.skin, params.automask, params.ui_correction)) {
+		return false;
+	}
+	SetCommonParams(params.style, params.preset, params.intensity, params.tone, params.structure, params.skin,
+			params.automask, params.ui_correction, params.reset ? 1 : 0);
+
+	// 1) Helper D3D11: copy the OBS-rendered frame into the D3D12-visible
+	// relay texture. The keyed mutex (when present) orders this against the
+	// OBS render; Flush() submits immediately.
+	if (g_obs_in_km) {
+		if (FAILED(g_obs_in_km->AcquireSync(0, 100))) {
+			SetError("process_gpu: timed out acquiring input mutex");
+			return false;
+		}
+	}
+	g_helper_ctx->CopyResource(g_relay_in.Get(), g_obs_in.Get());
+	if (g_obs_in_km)
+		g_obs_in_km->ReleaseSync(0);
+	g_helper_ctx->Flush();
+
+	// 2) D3D12: NGX consumes the relay input and writes the relay output.
+	// Opened cross-API resources start out in the COMMON state and decay
+	// back to COMMON after ExecuteCommandLists.
+	D3D12_RESOURCE_BARRIER toColor = Barrier(g_shared_color.Get(), D3D12_RESOURCE_STATE_COMMON,
+						 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	D3D12_RESOURCE_BARRIER toOutput =
+		Barrier(g_shared_output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	D3D12_RESOURCE_BARRIER toCommon[2] = {
+		Barrier(g_shared_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON),
+		Barrier(g_shared_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+	};
+	g_cmd->ResourceBarrier(1, &toColor);
+	g_cmd->ResourceBarrier(1, &toOutput);
+
+	NGXResult er = g_shim_eval(reinterpret_cast<void *>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
+	g_cmd->ResourceBarrier(2, toCommon);
+	if (er != NGX_SUCCESS) {
+		SetError("DLSSNR EvaluateFeature failed: 0x%08X", static_cast<unsigned>(er));
+		ExecuteAndWait(); // reset the command list to a clean state
+		return false;
+	}
+	if (!ExecuteAndWait())
+		return false;
+
+	// 3) Helper D3D11: publish the result to the OBS-visible output.
+	g_helper_ctx->CopyResource(g_obs_out.Get(), g_relay_out.Get());
+	g_helper_ctx->Flush();
 	return true;
 }
 
