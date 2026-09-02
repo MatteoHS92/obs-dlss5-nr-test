@@ -30,13 +30,15 @@
 ## Installation
 
 1. Download `obs-dlss5-nr-<version>-windows-x64.zip` from [Releases](https://github.com/Saganaki22/obs-dlss5-nr/releases).
-2. Extract it into `%APPDATA%\obs-studio\plugins\` so you end up with:
+2. Extract it into `C:\ProgramData\obs-studio\plugins\` so you end up with:
 
    ```
-   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\bin\64bit\obs-dlss5-nr.dll
-   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\bin\64bit\nvngx.dll_obs.dll
-   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\data\locale\en-US.ini
+   C:\ProgramData\obs-studio\plugins\obs-dlss5-nr\bin\64bit\obs-dlss5-nr.dll
+   C:\ProgramData\obs-studio\plugins\obs-dlss5-nr\bin\64bit\nvngx.dll_obs.dll
+   C:\ProgramData\obs-studio\plugins\obs-dlss5-nr\data\locale\en-US.ini
    ```
+
+   (This is the directory OBS scans for manually-installed plugins on Windows — not `%APPDATA%`.)
 
 3. Place your `nvngx_dlssnr.dll` in the plugin's config folder:
 
