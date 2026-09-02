@@ -83,6 +83,8 @@ struct dlss5nr_filter {
 	bool gpu_broken = false;    // set when shared-texture setup fails; avoid per-frame retry
 	bool gpu_zero_copy = false; // user opt-in; experimental
 	bool async_mode = true;     // "Smooth": NR on worker thread, +1 frame latency
+	uint32_t nr_fps = 0;        // 0 = process every frame; else throttle NR to N fps
+	uint64_t last_submit_ns = 0;
 
 	// Async machinery (Smooth mode). The graphics thread only snapshots
 	// frames into jobs and draws the newest completed result; a worker
@@ -609,9 +611,10 @@ static bool process_cpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 	draw_texture(f->out_tex, cx, cy);
 	return true;
 }
-
 // Smooth mode: snapshot this frame into a job, then draw the newest
 // completed result (or pass through until the first result exists).
+// nr_fps throttles how often frames are submitted for processing; between
+// submissions the last NR'd frame keeps displaying.
 static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx, uint32_t cy)
 {
 	UNUSED_PARAMETER(context);
@@ -620,63 +623,77 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 	if (!ensure_cpu_surfaces(f, cx, cy))
 		return false;
 
-	// Grab the parent's rendered frame.
-	gs_texrender_reset(f->texrender);
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+	bool submit = true;
+	if (f->nr_fps > 0) {
+		const uint64_t now = os_gettime_ns();
+		const uint64_t interval_ns = 1000000000ULL / f->nr_fps;
+		if (now - f->last_submit_ns < interval_ns) {
+			submit = false;
+		} else {
+			f->last_submit_ns = now;
+		}
+	}
 
 	bool grabbed = false;
-	if (gs_texrender_begin(f->texrender, cx, cy)) {
-		gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
-		obs_source_video_render(parent);
-		gs_texrender_end(f->texrender);
-		grabbed = true;
+	if (submit) {
+		// Grab the parent's rendered frame.
+		gs_texrender_reset(f->texrender);
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+
+		if (gs_texrender_begin(f->texrender, cx, cy)) {
+			gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+			obs_source_video_render(parent);
+			gs_texrender_end(f->texrender);
+			grabbed = true;
+		}
+		gs_blend_state_pop();
 	}
-	gs_blend_state_pop();
-	if (!grabbed)
-		return false;
 
-	gs_texture_t *src_tex = gs_texrender_get_texture(f->texrender);
-	if (!src_tex)
-		return false;
+	if (grabbed) {
+		gs_texture_t *src_tex = gs_texrender_get_texture(f->texrender);
+		if (src_tex) {
+			gs_stage_texture(f->stagesurface, src_tex);
+			uint8_t *mapped = nullptr;
+			uint32_t pitch = 0;
+			if (gs_stagesurface_map(f->stagesurface, &mapped, &pitch)) {
+				// Snapshot into a job; drop the oldest if the queue is full.
+				dlss5nr_filter::AsyncJob job;
+				job.pitch = pitch;
+				job.w = cx;
+				job.h = cy;
+				job.seq = ++f->submit_seq;
+				job.params.style = f->style;
+				job.params.preset = f->preset;
+				job.params.intensity = f->intensity;
+				job.params.tone = f->tone;
+				job.params.structure = f->structure;
+				job.params.skin = f->skin;
+				job.params.automask = f->automask ? 1 : 0;
+				job.params.ui_correction = f->ui_correction;
+				job.params.reset = f->reset_pending ? 1 : 0;
+				f->reset_pending = false;
 
-	gs_stage_texture(f->stagesurface, src_tex);
-	uint8_t *mapped = nullptr;
-	uint32_t pitch = 0;
-	if (!gs_stagesurface_map(f->stagesurface, &mapped, &pitch))
-		return false;
+				job.pixels.resize((size_t)pitch * cy);
+				memcpy(job.pixels.data(), mapped, (size_t)pitch * cy);
+				gs_stagesurface_unmap(f->stagesurface);
 
-	// Snapshot into a job; drop the oldest if the queue is full.
-	dlss5nr_filter::AsyncJob job;
-	job.pitch = pitch;
-	job.w = cx;
-	job.h = cy;
-	job.seq = ++f->submit_seq;
-	job.params.style = f->style;
-	job.params.preset = f->preset;
-	job.params.intensity = f->intensity;
-	job.params.tone = f->tone;
-	job.params.structure = f->structure;
-	job.params.skin = f->skin;
-	job.params.automask = f->automask ? 1 : 0;
-	job.params.ui_correction = f->ui_correction;
-	job.params.reset = f->reset_pending ? 1 : 0;
-	f->reset_pending = false;
-
-	job.pixels.resize((size_t)pitch * cy);
-	memcpy(job.pixels.data(), mapped, (size_t)pitch * cy);
-	gs_stagesurface_unmap(f->stagesurface);
-
-	{
-		std::lock_guard<std::mutex> lock(f->job_mutex);
-		if (f->jobs.size() >= 2)
-			f->jobs.pop_front();
-		f->jobs.push_back(std::move(job));
+				{
+					std::lock_guard<std::mutex> lock(f->job_mutex);
+					if (f->jobs.size() >= 2)
+						f->jobs.pop_front();
+					f->jobs.push_back(std::move(job));
+				}
+				f->job_cv.notify_one();
+			} else {
+				gs_stagesurface_unmap(f->stagesurface);
+			}
+		}
 	}
-	f->job_cv.notify_one();
 
 	// Draw the newest completed result; keep drawing it while a newer one
-	// is in flight so the output never flickers between NR and raw.
+	// is in flight (and between throttled submissions) so the output never
+	// flickers between NR and raw.
 	bool new_result = false;
 	{
 		std::lock_guard<std::mutex> lock(f->result_mutex);
@@ -770,6 +787,9 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	if (f->initialized && f->async_mode && !new_async)
 		stop_worker(f); // realtime mode takes over the bridge directly
 	f->async_mode = new_async;
+	f->nr_fps = (uint32_t)obs_data_get_int(settings, "nr_fps");
+	if (f->nr_fps && f->last_submit_ns == 0)
+		f->last_submit_ns = os_gettime_ns() - 1000000000ULL; // submit immediately on first gated frame
 	f->gpu_zero_copy = obs_data_get_bool(settings, "gpu_zero_copy");
 	if (!f->gpu_zero_copy && f->using_gpu) {
 		destroy_gpu_surfaces(f);
@@ -843,6 +863,15 @@ static obs_properties_t *dlss5nr_properties(void *data)
 	obs_property_list_add_bool(mode, obs_module_text("ProcessingMode.Realtime"), false);
 	obs_property_set_long_description(mode, obs_module_text("ProcessingMode.Tip"));
 
+	obs_property_t *nr_fps = obs_properties_add_list(props, "nr_fps", obs_module_text("NRFps"), OBS_COMBO_TYPE_LIST,
+							 OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(nr_fps, obs_module_text("NRFps.Source"), 0);
+	obs_property_list_add_int(nr_fps, "60", 60);
+	obs_property_list_add_int(nr_fps, "30", 30);
+	obs_property_list_add_int(nr_fps, "24", 24);
+	obs_property_list_add_int(nr_fps, "15", 15);
+	obs_property_set_long_description(nr_fps, obs_module_text("NRFps.Tip"));
+
 	obs_properties_add_button(props, "reset_history", obs_module_text("ResetHistory.Button"),
 				  dlss5nr_reset_history_cb);
 
@@ -861,6 +890,7 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "gpu_index", 0);
 	obs_data_set_default_bool(settings, "gpu_zero_copy", false);
 	obs_data_set_default_bool(settings, "async_mode", true);
+	obs_data_set_default_int(settings, "nr_fps", 0);
 	obs_data_set_default_int(settings, "channel_order", DLSSNR_CHANNEL_AUTO);
 	obs_data_set_default_string(settings, "status", "");
 }
