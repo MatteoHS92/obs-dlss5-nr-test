@@ -1,0 +1,19 @@
+name: No proprietary binaries
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject NVIDIA runtime binaries
+        run: |
+          found=0
+          while IFS= read -r -d '' f; do
+            echo "::error file=$f::NVIDIA proprietary binary must not be committed: $f"
+            found=1
+          done < <(find . -type f \( -iname '_nvngx*.dll' -o -iname 'nvngx*.dll' -o -iname 'nvsdk_ngx*.lib' -o -iname 'nvsdk_ngx*.dll' \) -print0)
+          exit $found

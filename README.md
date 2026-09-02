@@ -5,31 +5,73 @@
 > ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
 > This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Status — Phase 1
+## Status — Phase 3
 
 - [x] Plugin skeleton from obs-plugintemplate, renamed `obs-dlss5-nr`
 - [x] Pass-through video filter (copies input → output unchanged)
 - [x] Full properties UI: Style (Default/Natural/Cinematic), Render Preset, Intensity, Local Tone, Local Structure, Skin, Auto Mask, UI Correction, GPU Index, Channel Order, Reset History
-- [ ] **Phase 2** — D3D12 + NGX bridge (`nvngx_dlssnr`, feature 18), CPU-staged frame processing
-- [ ] **Phase 3** — release packaging + runtime DLL install instructions
-- [ ] **Phase 4** — zero-copy D3D11↔D3D12 interop, optical-flow motion vectors
+- [x] Release packaging + CI (automated Windows builds and draft releases on tags)
+- [ ] **Phase 4** — D3D12 + NGX bridge (`nvngx_dlssnr`, feature 18), frame processing
+- [ ] **Phase 5** — zero-copy D3D11↔D3D12 interop, optical-flow motion vectors
 
-## Requirements (end users)
+## Requirements
 
-- Windows 10/11 x64, NVIDIA RTX GPU, recent driver
-- A **legally obtained** `nvngx_dlssnr.dll` placed in the plugin's `data/runtime/` folder (Phase 3). **This project never redistributes NVIDIA binaries.**
+- Windows 10/11 x64
+- NVIDIA RTX GPU (see compatibility below) with driver **616.56 or newer**
+- OBS Studio 31.1 or newer
+- A **legally obtained** `nvngx_dlssnr.dll` — **this project never redistributes NVIDIA binaries**
 
-## Building
+## Installation
 
-Same toolchain as [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate): Visual Studio 2022, CMake ≥ 3.28, Ninja.
+1. Download `obs-dlss5-nr-<version>-windows-x64.zip` from [Releases](https://github.com/Saganaki22/obs-dlss5-nr/releases).
+2. Extract it into `%APPDATA%\obs-studio\plugins\` so you end up with:
+
+   ```
+   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\obs-dlss5-nr.dll
+   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\locale\en-US.ini
+   ```
+
+3. Place your `nvngx_dlssnr.dll` in the plugin's config folder:
+
+   ```
+   %APPDATA%\obs-studio\plugin_config\obs-dlss5-nr\runtime\nvngx_dlssnr.dll
+   ```
+
+   The filter's **Status** line in the properties panel shows this exact path if the runtime is missing.
+
+4. Restart OBS, add the filter to any video source:
+   *Filters → Effect Filters → DLSS 5 Neural Rendering*
+
+The NGX core (`_nvngx.dll`) is not copied by hand — the plugin discovers it automatically in your installed NVIDIA driver.
+
+## GPU / runtime compatibility
+
+DLSS NR support is decided by the `nvngx_dlssnr.dll` build you supply — the plugin relays the runtime's verdict to the Status line and falls back to clean pass-through video when a GPU is rejected.
+
+| GPU | Status |
+|---|---|
+| RTX 50xx | Expected to work with runtime builds targeting DLSS 5 |
+| RTX 40xx | Works with runtime builds patched for Ada |
+| RTX 30xx | Unverified — the runtime may reject it |
+| Older / non-RTX / AMD / Intel | Not supported |
+
+If the Status line shows `0xBAD00001`, your runtime build does not support your GPU/driver combination.
+
+## Building from source
+
+Same toolchain as [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate): Visual Studio 2022 (or Build Tools), CMake ≥ 3.28, Windows SDK 10.0.22621+.
 
 ```powershell
-cmake --preset windows-x64
-cmake --build build-x64 --config Release
+cmake -S . -B build_x64
+cmake --build build_x64 --config RelWithDebInfo
 ```
 
 Non-Windows platforms build an empty module (the filter only registers on `_WIN32`).
 
+## Releases
+
+Tags using semantic versioning (e.g. `0.3.0`) trigger the GitHub Actions release workflow, which builds Windows x64 packages and creates a draft release. See `docs/RELEASING.md`.
+
 ## License
 
-GPL-2.0 (see `LICENSE`). Phase 2 will vendor MIT-licensed bridge code from [lisitskyaa/ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR) — see `THIRD_PARTY_NOTICES.md`.
+GPL-2.0 (see `LICENSE`). Integration follows the NVIDIA NGX / DLSS SDK interface — see `THIRD_PARTY_NOTICES.md`.
