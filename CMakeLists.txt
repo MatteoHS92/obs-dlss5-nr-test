@@ -40,7 +40,25 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 
 if(OS_WINDOWS)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/dlss5-nr-filter.cpp)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/dlss5-nr-filter.cpp src/bridge/nr_bridge.cpp)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE d3d12 dxgi)
+
+  # Caller shim: the DLSS NR runtime validates the calling module, so the
+  # snippet calls must be forwarded through this separate DLL.
+  add_library(nr-caller-shim SHARED src/bridge/caller_shim.cpp)
+  target_link_libraries(nr-caller-shim PRIVATE d3d12)
+  set_target_properties(
+    nr-caller-shim
+    PROPERTIES OUTPUT_NAME "nvngx.dll_obs" PREFIX "" SUFFIX ".dll"
+  )
+  add_custom_command(
+    TARGET nr-caller-shim
+    POST_BUILD
+    COMMAND
+      ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:nr-caller-shim> ${CMAKE_CURRENT_BINARY_DIR}/rundir/$<CONFIG>
+    COMMENT "Copy nr-caller-shim to rundir"
+  )
+  install(TARGETS nr-caller-shim RUNTIME DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
 endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

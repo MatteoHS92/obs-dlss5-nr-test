@@ -5,14 +5,20 @@
 > ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
 > This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Status — Phase 3
+## Status — Phase 4
 
 - [x] Plugin skeleton from obs-plugintemplate, renamed `obs-dlss5-nr`
-- [x] Pass-through video filter (copies input → output unchanged)
 - [x] Full properties UI: Style (Default/Natural/Cinematic), Render Preset, Intensity, Local Tone, Local Structure, Skin, Auto Mask, UI Correction, GPU Index, Channel Order, Reset History
 - [x] Release packaging + CI (automated Windows builds and draft releases on tags)
-- [ ] **Phase 4** — D3D12 + NGX bridge (`nvngx_dlssnr`, feature 18), frame processing
+- [x] D3D12 + NGX bridge: feature 18 processing with fail-open pass-through on any error
 - [ ] **Phase 5** — zero-copy D3D11↔D3D12 interop, optical-flow motion vectors
+
+### Known limitations
+
+- NR runs synchronously on the OBS graphics thread — expect reduced fps while the filter is active.
+- One NR filter at a time (the NGX feature is shared; multiple instances thrash rebuilds).
+- Style/Preset changes rebuild the NGX feature (one-frame hitch). Other sliders apply live.
+- Frame processing uses CPU staging; a zero-copy GPU interop path is planned.
 
 ## Requirements
 
@@ -27,8 +33,9 @@
 2. Extract it into `%APPDATA%\obs-studio\plugins\` so you end up with:
 
    ```
-   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\obs-dlss5-nr.dll
-   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\locale\en-US.ini
+   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\bin\64bit\obs-dlss5-nr.dll
+   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\bin\64bit\nvngx.dll_obs.dll
+   %APPDATA%\obs-studio\plugins\obs-dlss5-nr\data\locale\en-US.ini
    ```
 
 3. Place your `nvngx_dlssnr.dll` in the plugin's config folder:
