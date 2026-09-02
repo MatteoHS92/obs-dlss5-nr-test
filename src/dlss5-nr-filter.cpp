@@ -77,7 +77,8 @@ struct dlss5nr_filter {
 	IDXGIKeyedMutex *shared_in_km = nullptr;
 	uint32_t shared_w = 0, shared_h = 0;
 	bool using_gpu = false;
-	bool gpu_broken = false; // set when shared-texture setup fails; avoid per-frame retry
+	bool gpu_broken = false;    // set when shared-texture setup fails; avoid per-frame retry
+	bool gpu_zero_copy = false; // user opt-in; experimental
 
 	// CPU staging fallback surfaces.
 	gs_texrender_t *texrender = nullptr;
@@ -544,7 +545,7 @@ static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 	const bool bridge_ready = ensure_bridge_ready(f);
 	bool processed = false;
 
-	if (bridge_ready && gs_shared_texture_available()) {
+	if (bridge_ready && f->gpu_zero_copy && gs_shared_texture_available()) {
 		switch (process_gpu_path(f, parent, context, cx, cy)) {
 		case GpuResult::Ok:
 			processed = true;
@@ -589,6 +590,11 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	f->ui_correction = 0;
 	f->gpu_index = (int)obs_data_get_int(settings, "gpu_index");
 	f->channel_order = (int)obs_data_get_int(settings, "channel_order");
+	f->gpu_zero_copy = obs_data_get_bool(settings, "gpu_zero_copy");
+	if (!f->gpu_zero_copy && f->using_gpu) {
+		destroy_gpu_surfaces(f);
+		f->gpu_broken = false;
+	}
 	f->initialized = true;
 }
 
@@ -641,6 +647,8 @@ static obs_properties_t *dlss5nr_properties(void *data)
 
 	obs_properties_add_int(advanced, "gpu_index", obs_module_text("GPUIndex"), 0, 15, 1);
 
+	obs_properties_add_bool(advanced, "gpu_zero_copy", obs_module_text("GPUZeroCopy"));
+
 	obs_property_t *chan = obs_properties_add_list(advanced, "channel_order", obs_module_text("ChannelOrder"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(chan, obs_module_text("ChannelOrder.Auto"), DLSSNR_CHANNEL_AUTO);
@@ -665,6 +673,7 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "skin", -1.0);
 	obs_data_set_default_bool(settings, "automask", false);
 	obs_data_set_default_int(settings, "gpu_index", 0);
+	obs_data_set_default_bool(settings, "gpu_zero_copy", false);
 	obs_data_set_default_int(settings, "channel_order", DLSSNR_CHANNEL_AUTO);
 	obs_data_set_default_string(settings, "status", "");
 }
