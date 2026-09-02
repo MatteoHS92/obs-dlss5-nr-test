@@ -5,20 +5,25 @@
 > ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
 > This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Status — Phase 4
+## Features (v1.1.0)
 
-- [x] Plugin skeleton from obs-plugintemplate, renamed `obs-dlss5-nr`
-- [x] Full properties UI: Style (Default/Natural/Cinematic), Render Preset, Intensity, Local Tone, Local Structure, Skin, Auto Mask, UI Correction, GPU Index, Channel Order, Reset History
-- [x] Release packaging + CI (automated Windows builds and draft releases on tags)
-- [x] D3D12 + NGX bridge: feature 18 processing with fail-open pass-through on any error
-- [ ] **Phase 5** — zero-copy D3D11↔D3D12 interop, optical-flow motion vectors
+- DLSS 5 Neural Rendering on any OBS video source, live
+- **Style**: Default / Natural / Cinematic (rebuilds the NR feature on change)
+- **Render Preset** (0–3), **Intensity**, **Local Tone**, **Local Structure**, **Skin Structure** sliders — applied per-frame
+- **Auto Mask**
+- **Processing Mode**:
+  - *Smooth* (default) — NR runs on a worker thread one frame behind; OBS keeps full frame rate
+  - *Low latency* — inline processing for game capture where delay matters
+- **NR Frame Rate** throttle — Match source / 60 / 30 / 24 / 15 fps; between NR frames the last enhanced frame is displayed (a performance dial)
+- **Reset History** button (fixes smearing after scene cuts)
+- Advanced: GPU Index, Channel Order (auto-detects runtime BGRA/RGBA quirks), experimental zero-copy toggle (off by default — see status)
+- Fail-safe design: any NGX/runtime error falls back to clean pass-through video and is reported in the filter's Status line
 
-### Known limitations
+## Current status
 
-- NR runs synchronously on the OBS graphics thread — expect reduced fps while the filter is active.
-- One NR filter at a time (the NGX feature is shared; multiple instances thrash rebuilds).
-- Style/Preset changes rebuild the NGX feature (one-frame hitch). Other sliders apply live.
-- Frame processing uses CPU staging; a zero-copy GPU interop path is planned.
+- ✅ Stable NR processing (CPU-staged) — recommended
+- ⚠️ Zero-copy GPU path: experimental, **off by default**. The NR runtime currently aborts the process when writing into D3D11-shared textures at 4K. Enable only for testing.
+- ❌ Motion vectors: NR runs per-frame (no temporal flow yet) — planned
 
 ## Requirements
 
@@ -79,7 +84,7 @@ Non-Windows platforms build an empty module (the filter only registers on `_WIN3
 
 ## Releases
 
-Tags using semantic versioning (e.g. `0.3.0`) trigger the GitHub Actions release workflow, which builds Windows x64 packages and creates a draft release. See `docs/RELEASING.md`.
+Tags using semantic versioning (e.g. `v1.1.0`) trigger the GitHub Actions release workflow, which builds Windows x64 packages and creates a release. See `docs/RELEASING.md`.
 
 ## License
 

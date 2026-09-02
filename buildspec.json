@@ -38,7 +38,7 @@
     },
     "name": "obs-dlss5-nr",
     "displayName": "DLSS 5 Neural Rendering",
-    "version": "0.1.0",
+    "version": "1.1.0",
     "author": "Saganaki22",
     "website": "https://github.com/Saganaki22/obs-dlss5-nr",
     "email": "me@example.com"
