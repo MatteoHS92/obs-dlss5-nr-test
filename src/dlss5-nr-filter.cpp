@@ -388,16 +388,24 @@ static void render_parent_into(dlss5nr_filter *f, obs_source_t *parent, uint32_t
 	gs_viewport_pop();
 }
 
-static bool process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx, uint32_t cy)
+// Outcome of a GPU-path attempt.
+enum class GpuResult {
+	Ok,     // frame processed and drawn
+	Skip,   // transient failure — pass through this frame, stay on GPU
+	Broken, // setup failed — detach and use CPU staging from now on
+};
+
+static GpuResult process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx,
+				  uint32_t cy)
 {
 	UNUSED_PARAMETER(context);
 	if (!ensure_gpu_surfaces(f, cx, cy))
-		return false;
+		return GpuResult::Broken;
 
 	if (f->shared_in_km) {
 		if (FAILED(f->shared_in_km->AcquireSync(0, KM_TIMEOUT_MS))) {
 			f->set_status("Input texture busy — passing through this frame");
-			return false;
+			return GpuResult::Skip;
 		}
 	}
 
@@ -422,7 +430,9 @@ static bool process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 	if (!nrbridge::process_gpu((int)cx, (int)cy, p)) {
 		f->set_status("NR failed — passing through. %s", nrbridge::last_error());
 		log_error_throttled(f, nrbridge::last_error());
-		return false;
+		// Transient errors keep GPU mode; the bridge refuses CPU staging
+		// while attached, so falling through to CPU here would crash.
+		return GpuResult::Skip;
 	}
 
 	// The bridge refreshes this every 300 frames; log it when it changes.
@@ -436,7 +446,7 @@ static bool process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 	}
 
 	draw_texture(f->shared_out, cx, cy);
-	return true;
+	return GpuResult::Ok;
 }
 
 static bool process_cpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx, uint32_t cy)
@@ -516,17 +526,27 @@ static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 	const bool bridge_ready = ensure_bridge_ready(f);
 	bool processed = false;
 
-	if (bridge_ready) {
-		if (gs_shared_texture_available())
-			processed = process_gpu_path(f, parent, context, cx, cy);
-		if (!processed)
+	if (bridge_ready && gs_shared_texture_available()) {
+		switch (process_gpu_path(f, parent, context, cx, cy)) {
+		case GpuResult::Ok:
+			processed = true;
+			break;
+		case GpuResult::Skip:
+			break; // pass through this frame; GPU mode stays attached
+		case GpuResult::Broken:
+			// Surfaces are detached now; CPU staging is safe again.
 			processed = process_cpu_path(f, parent, context, cx, cy);
-	} else if (f->reset_pending) {
-		f->reset_pending = false;
+			break;
+		}
+	} else if (bridge_ready) {
+		processed = process_cpu_path(f, parent, context, cx, cy);
 	}
 
-	if (!processed)
+	if (!processed) {
+		if (f->reset_pending)
+			f->reset_pending = false;
 		obs_source_skip_video_filter(context);
+	}
 }
 
 // ----------------------------------------------------------------- settings

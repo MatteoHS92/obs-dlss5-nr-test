@@ -892,6 +892,12 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 		SetError("NR bridge is not initialized");
 		return false;
 	}
+	// The two paths use mutually exclusive resources; a shared-texture
+	// attach means the staging buffers do not exist.
+	if (g_gpu_mode) {
+		SetError("CPU staging unavailable while GPU path is attached");
+		return false;
+	}
 	if (!src_bgra || !dst_bgra || width <= 0 || height <= 0) {
 		SetError("Invalid image buffer/dimensions");
 		return false;
