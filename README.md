@@ -30,7 +30,27 @@
 - Windows 10/11 x64
 - NVIDIA RTX GPU (see compatibility below) with driver **616.56 or newer**
 - OBS Studio 31.1 or newer
-- A **legally obtained** `nvngx_dlssnr.dll` — **this project never redistributes NVIDIA binaries**
+
+## ⚠️ Required runtime file — NOT included
+
+The release ZIP **intentionally does not contain NVIDIA's proprietary software**. You need **one file**, and you must obtain it yourself:
+
+- **`nvngx_dlssnr.dll`** — the DLSS 5 Neural Rendering runtime (~158 MB, v310.8+)
+
+For legal reasons this project cannot provide, link, or mirror that file. Places people legitimately acquire it:
+
+- **Your own install of a game that ships DLSS 5 NR** — e.g. copy `nvngx_dlssnr.dll` out of the **NBA 2K27** game folder
+- The **NVIDIA DLSS SDK**, if a release includes the NR runtime
+
+Everything else is handled for you: the NGX core (`_nvngx.dll`) is discovered automatically inside your installed NVIDIA driver, and no other file from game/SDK folders is needed.
+
+Place the file at:
+
+```
+%APPDATA%\obs-studio\plugin_config\obs-dlss5-nr\runtime\nvngx_dlssnr.dll
+```
+
+The filter's **Status** line shows this exact path when the file is missing.
 
 ## Installation
 

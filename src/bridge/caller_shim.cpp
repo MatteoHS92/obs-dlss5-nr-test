@@ -41,26 +41,26 @@ static __forceinline NGXResult FinishCall(NGXResult r)
 
 extern "C" {
 
-__declspec(dllexport) __declspec(noinline) NGXResult __cdecl DLSSNR_CallInit(void *real_fn, unsigned long long app_id,
-									     const wchar_t *path, ID3D12Device *device,
-									     int version, const void *common_info)
+__declspec(dllexport)
+__declspec(noinline) NGXResult __cdecl DLSSNR_CallInit(void *real_fn, unsigned long long app_id, const wchar_t *path,
+						       ID3D12Device *device, int version, const void *common_info)
 {
 	NGXResult r = reinterpret_cast<SnippetInitFn>(real_fn)(app_id, path, device, common_info, version);
 	return FinishCall(r);
 }
 
-__declspec(dllexport) __declspec(noinline) NGXResult __cdecl DLSSNR_CallCreate(void *real_fn,
-									       ID3D12GraphicsCommandList *list,
-									       int feature_id, NGXParameter *params,
-									       NGXHandle **handle)
+__declspec(dllexport)
+__declspec(noinline) NGXResult __cdecl DLSSNR_CallCreate(void *real_fn, ID3D12GraphicsCommandList *list, int feature_id,
+							 NGXParameter *params, NGXHandle **handle)
 {
 	NGXResult r = reinterpret_cast<CreateFn>(real_fn)(list, feature_id, params, handle);
 	return FinishCall(r);
 }
 
-__declspec(dllexport) __declspec(noinline) NGXResult __cdecl
-DLSSNR_CallEvaluate(void *real_fn, ID3D12GraphicsCommandList *list, const NGXHandle *handle, const NGXParameter *params,
-		    void *callback)
+__declspec(dllexport)
+__declspec(noinline) NGXResult __cdecl DLSSNR_CallEvaluate(void *real_fn, ID3D12GraphicsCommandList *list,
+							   const NGXHandle *handle, const NGXParameter *params,
+							   void *callback)
 {
 	NGXResult r = reinterpret_cast<EvalFn>(real_fn)(list, handle, params, callback);
 	return FinishCall(r);
