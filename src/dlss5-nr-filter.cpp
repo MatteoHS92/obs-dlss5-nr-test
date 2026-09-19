@@ -61,6 +61,7 @@ struct dlss5nr_filter {
 	float structure = 1.0f;
 	float skin = -1.0f;
 	bool automask = false;
+	bool temporal = false; // NVIDIA Optical Flow motion vectors for NR
 	int ui_correction = 0;
 	int gpu_index = 0;
 	int channel_order = DLSSNR_CHANNEL_AUTO;
@@ -526,6 +527,7 @@ static GpuResult process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_s
 	p.structure = f->structure;
 	p.skin = f->skin;
 	p.automask = f->automask ? 1 : 0;
+	p.temporal = f->temporal ? 1 : 0;
 	p.ui_correction = f->ui_correction;
 	p.reset = f->reset_pending ? 1 : 0;
 	f->reset_pending = false;
@@ -594,6 +596,7 @@ static bool process_cpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 	p.structure = f->structure;
 	p.skin = f->skin;
 	p.automask = f->automask ? 1 : 0;
+	p.temporal = f->temporal ? 1 : 0;
 	p.ui_correction = f->ui_correction;
 	p.reset = f->reset_pending ? 1 : 0;
 	f->reset_pending = false;
@@ -670,6 +673,7 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 				job.params.structure = f->structure;
 				job.params.skin = f->skin;
 				job.params.automask = f->automask ? 1 : 0;
+				job.params.temporal = f->temporal ? 1 : 0;
 				job.params.ui_correction = f->ui_correction;
 				job.params.reset = f->reset_pending ? 1 : 0;
 				f->reset_pending = false;
@@ -777,6 +781,7 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	f->structure = (float)obs_data_get_double(settings, "structure");
 	f->skin = (float)obs_data_get_double(settings, "skin");
 	f->automask = obs_data_get_bool(settings, "automask");
+	f->temporal = obs_data_get_bool(settings, "temporal");
 	// DLSSNR.UICorrection is left disabled (0): the runtime renders black
 	// with correction enabled unless UI-detection inputs are provided, and
 	// the reference integrations hardcode it off.
@@ -843,6 +848,13 @@ static obs_properties_t *dlss5nr_properties(void *data)
 	obs_properties_add_float_slider(props, "structure", obs_module_text("LocalStructure"), 0.0, 2.0, 0.05);
 	obs_properties_add_float_slider(props, "skin", obs_module_text("Skin"), -1.0, 2.0, 0.05);
 	obs_properties_add_bool(props, "automask", obs_module_text("AutoMask"));
+
+	obs_property_t *temporal = obs_properties_add_list(props, "temporal", obs_module_text("Temporal"),
+							   OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_BOOL);
+	obs_property_list_add_bool(temporal, obs_module_text("Temporal.Off"), false);
+	obs_property_list_add_bool(temporal, obs_module_text("Temporal.On"), true);
+	obs_property_set_long_description(temporal, obs_module_text("Temporal.Tip"));
+
 	obs_properties_t *advanced = obs_properties_create();
 
 	obs_properties_add_int(advanced, "gpu_index", obs_module_text("GPUIndex"), 0, 15, 1);
@@ -887,6 +899,7 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "structure", 1.0);
 	obs_data_set_default_double(settings, "skin", -1.0);
 	obs_data_set_default_bool(settings, "automask", false);
+	obs_data_set_default_bool(settings, "temporal", false);
 	obs_data_set_default_int(settings, "gpu_index", 0);
 	obs_data_set_default_bool(settings, "gpu_zero_copy", false);
 	obs_data_set_default_bool(settings, "async_mode", true);

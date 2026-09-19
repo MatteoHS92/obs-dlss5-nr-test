@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "nr_bridge.h"
+#include "nvof_flow.h"
 
 using Microsoft::WRL::ComPtr;
 using NGXResult = int;
@@ -139,11 +140,20 @@ static ComPtr<ID3D12Resource> g_color;
 static ComPtr<ID3D12Resource> g_output;
 static ComPtr<ID3D12Resource> g_upload;
 static ComPtr<ID3D12Resource> g_readback;
+// Temporal mode: full-resolution R16G16_FLOAT UV motion vectors estimated by
+// NVIDIA Optical Flow from the raw input frames (CPU path only).
+static ComPtr<ID3D12Resource> g_mvec;
+static ComPtr<ID3D12Resource> g_mvec_upload;
+static UINT g_mvec_row_pitch = 0;
+static UINT64 g_mvec_total_bytes = 0;
+static ComPtr<IDXGIAdapter1> g_adapter;
 static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
 static UINT64 g_total_bytes = 0;
 static int g_feature_style = -999;
 static int g_feature_preset = -999;
 static int g_feature_ui_correction = -999;
+// Temporal setting latched at feature creation: -1 unknown, 0 off, 1 on.
+static int g_feature_motion = -1;
 // Channel-order verdict is stable per feature build: -1 unknown, 0 RGBA, 1 BGRA.
 static int g_slots_are_bgra_cache = -1;
 
@@ -441,7 +451,8 @@ static D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES b
 	return b;
 }
 
-static ComPtr<ID3D12Resource> CreateTexture(UINT w, UINT h, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags)
+static ComPtr<ID3D12Resource> CreateTexture(UINT w, UINT h, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags,
+					    DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT)
 {
 	D3D12_RESOURCE_DESC d{};
 	d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -449,7 +460,7 @@ static ComPtr<ID3D12Resource> CreateTexture(UINT w, UINT h, D3D12_RESOURCE_STATE
 	d.Height = h;
 	d.DepthOrArraySize = 1;
 	d.MipLevels = 1;
-	d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	d.Format = fmt;
 	d.SampleDesc.Count = 1;
 	d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	d.Flags = flags;
@@ -526,6 +537,81 @@ static float HalfToFloat(uint16_t h)
 	return f;
 }
 
+static bool UploadMotionVectorTexture(const NvofFlowFrame *flow, bool execute_now)
+{
+	if (!g_mvec || !g_mvec_upload || g_width == 0 || g_height == 0) {
+		SetError("Motion-vector resources are not allocated");
+		return false;
+	}
+
+	void *mapped = nullptr;
+	HRESULT hr = g_mvec_upload->Map(0, nullptr, &mapped);
+	if (FAILED(hr) || !mapped) {
+		SetError("Motion-vector upload Map failed: 0x%08X", static_cast<unsigned>(hr));
+		return false;
+	}
+	memset(mapped, 0, static_cast<size_t>(g_mvec_total_bytes));
+
+	if (flow && flow->has_flow) {
+		if (flow->width == 0 || flow->height == 0 ||
+		    flow->xy.size() < static_cast<size_t>(flow->width) * flow->height * 2) {
+			g_mvec_upload->Unmap(0, nullptr);
+			SetError("NVIDIA Optical Flow returned an invalid flow field");
+			return false;
+		}
+
+		// NVOF returns S10.5 current->previous displacement in pixels. DLSS's
+		// contract stores normalized UV and multiplies by MVecScale=(W,H), so:
+		//   stored = fixed / 32 / axis_size
+		// Use nearest reconstruction from the NVOF grid to avoid inventing
+		// vectors across disocclusion boundaries.
+		auto *dst_base = static_cast<uint8_t *>(mapped);
+		for (UINT y = 0; y < g_height; ++y) {
+			auto *row = reinterpret_cast<uint16_t *>(dst_base + static_cast<size_t>(y) * g_mvec_row_pitch);
+			const UINT cy =
+				std::min<UINT>(static_cast<UINT>((static_cast<uint64_t>(y) * flow->height) / g_height),
+					       flow->height - 1);
+			for (UINT x = 0; x < g_width; ++x) {
+				const UINT cx = std::min<UINT>(
+					static_cast<UINT>((static_cast<uint64_t>(x) * flow->width) / g_width),
+					flow->width - 1);
+				const size_t i = (static_cast<size_t>(cy) * flow->width + cx) * 2;
+				const float uvx = static_cast<float>(flow->xy[i + 0]) * (1.0f / 32.0f) /
+						  static_cast<float>(g_width);
+				const float uvy = static_cast<float>(flow->xy[i + 1]) * (1.0f / 32.0f) /
+						  static_cast<float>(g_height);
+				row[x * 2 + 0] = FloatToHalf(uvx);
+				row[x * 2 + 1] = FloatToHalf(uvy);
+			}
+		}
+	}
+	g_mvec_upload->Unmap(0, nullptr);
+
+	auto to_copy =
+		Barrier(g_mvec.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+	g_cmd->ResourceBarrier(1, &to_copy);
+
+	D3D12_TEXTURE_COPY_LOCATION dst{};
+	dst.pResource = g_mvec.Get();
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+	D3D12_TEXTURE_COPY_LOCATION src{};
+	src.pResource = g_mvec_upload.Get();
+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+	src.PlacedFootprint.Footprint.Width = g_width;
+	src.PlacedFootprint.Footprint.Height = g_height;
+	src.PlacedFootprint.Footprint.Depth = 1;
+	src.PlacedFootprint.Footprint.RowPitch = g_mvec_row_pitch;
+	g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	auto to_read =
+		Barrier(g_mvec.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	g_cmd->ResourceBarrier(1, &to_read);
+
+	return !execute_now || ExecuteAndWait();
+}
+
 static void ReleaseFeatureAndResources()
 {
 	WaitQueueIdle();
@@ -538,19 +624,27 @@ static void ReleaseFeatureAndResources()
 	}
 	// In GPU mode the shared textures outlive feature rebuilds; only the
 	// CPU-staging resources are owned here.
+	// NGX parameter objects do not necessarily AddRef resources stored in them.
+	if (g_params)
+		g_params->Set("DLSSNR.MVec", static_cast<ID3D12Resource *>(nullptr));
 	g_color.Reset();
 	g_output.Reset();
 	g_upload.Reset();
 	g_readback.Reset();
+	g_mvec.Reset();
+	g_mvec_upload.Reset();
+	g_mvec_row_pitch = 0;
+	g_mvec_total_bytes = 0;
 	if (!g_gpu_mode)
 		g_width = g_height = g_row_pitch = 0;
 	g_total_bytes = 0;
 	g_feature_style = -999;
 	g_feature_preset = -999;
 	g_feature_ui_correction = -999;
+	g_feature_motion = -1;
 }
 
-static bool AllocateFrameResources(UINT w, UINT h)
+static bool AllocateFrameResources(UINT w, UINT h, bool temporal)
 {
 	g_color = CreateTexture(w, h, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 				D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -571,11 +665,32 @@ static bool AllocateFrameResources(UINT w, UINT h)
 	}
 	g_width = w;
 	g_height = h;
+
+	if (temporal) {
+		g_mvec = CreateTexture(w, h, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE,
+				       DXGI_FORMAT_R16G16_FLOAT);
+		if (!g_mvec) {
+			SetError("Failed to create R16G16_FLOAT motion-vector texture");
+			return false;
+		}
+		g_mvec_row_pitch = (w * 4u + 255u) & ~255u;
+		g_mvec_total_bytes = static_cast<UINT64>(g_mvec_row_pitch) * h;
+		g_mvec_upload = CreateLinearBuffer(g_mvec_total_bytes, D3D12_HEAP_TYPE_UPLOAD,
+						   D3D12_RESOURCE_STATE_GENERIC_READ);
+		if (!g_mvec_upload) {
+			SetError("Failed to create motion-vector upload buffer");
+			return false;
+		}
+		// Feature creation always starts with a defined zero-MV resource. The
+		// first temporal frame also uses this; NVOF has no previous frame yet.
+		if (!UploadMotionVectorTexture(nullptr, true))
+			return false;
+	}
 	return true;
 }
 
 static void SetCommonParams(int style, int preset, float intensity, float tone, float structure, float skin,
-			    int automask, int ui_correction, int reset)
+			    int automask, int ui_correction, int reset, bool temporal)
 {
 	ID3D12Resource *color = g_gpu_mode ? g_shared_color.Get() : g_color.Get();
 	ID3D12Resource *output = g_gpu_mode ? g_shared_output.Get() : g_output.Get();
@@ -593,8 +708,25 @@ static void SetCommonParams(int style, int preset, float intensity, float tone, 
 	g_params->Set("DLSSNR.UICorrection", ui_correction);
 	g_params->Set("DLSSNR.DepthInverted", 1);
 	g_params->Set("DLSSNR.ScalingRatio", 1.0f);
-	g_params->Set("DLSSNR.MVecScaleX", 1.0f);
-	g_params->Set("DLSSNR.MVecScaleY", 1.0f);
+	if (temporal && g_mvec) {
+		g_params->Set("DLSSNR.MVec", g_mvec.Get());
+		// g_mvec stores normalized UV. Multiplying by dimensions reconstructs
+		// the original pixel displacement from NVOF exactly.
+		g_params->Set("DLSSNR.MVecScaleX", static_cast<float>(g_width));
+		g_params->Set("DLSSNR.MVecScaleY", static_cast<float>(g_height));
+		g_params->Set("DLSSNR.MVecSubrectBaseX", 0);
+		g_params->Set("DLSSNR.MVecSubrectBaseY", 0);
+		g_params->Set("DLSSNR.MVecSubrectWidth", g_width);
+		g_params->Set("DLSSNR.MVecSubrectHeight", g_height);
+	} else {
+		g_params->Set("DLSSNR.MVec", static_cast<ID3D12Resource *>(nullptr));
+		g_params->Set("DLSSNR.MVecScaleX", 1.0f);
+		g_params->Set("DLSSNR.MVecScaleY", 1.0f);
+		g_params->Set("DLSSNR.MVecSubrectBaseX", 0);
+		g_params->Set("DLSSNR.MVecSubrectBaseY", 0);
+		g_params->Set("DLSSNR.MVecSubrectWidth", 0);
+		g_params->Set("DLSSNR.MVecSubrectHeight", 0);
+	}
 	g_params->Set("DLSSNR.Color", color);
 	g_params->Set("DLSSNR.Output", output);
 	g_params->Set("DLSSNR.Backbuffer", output);
@@ -609,22 +741,23 @@ static void SetCommonParams(int style, int preset, float intensity, float tone, 
 }
 
 static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity, float tone, float structure,
-			  float skin, int automask, int ui_correction)
+			  float skin, int automask, int ui_correction, bool temporal)
 {
 	// Style, preset and UI correction are latched by the model at feature
 	// creation; changing them requires a rebuild (which also resets the
 	// temporal history). Intensity/tone/structure/skin/mask are per-frame.
+	const int motion_key = temporal ? 1 : 0;
 	const bool rebuild = !g_feature || (!g_gpu_mode && (w != g_width || h != g_height)) ||
 			     style != g_feature_style || preset != g_feature_preset ||
-			     ui_correction != g_feature_ui_correction;
+			     ui_correction != g_feature_ui_correction || motion_key != g_feature_motion;
 	if (!rebuild) {
-		SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 0);
+		SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 0, temporal);
 		return true;
 	}
 
 	ReleaseFeatureAndResources();
 	if (!g_gpu_mode) {
-		if (!AllocateFrameResources(w, h))
+		if (!AllocateFrameResources(w, h, temporal))
 			return false;
 	} else {
 		g_width = g_shared_w;
@@ -632,7 +765,7 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 	}
 	// The runtime latches model parameters at creation; reset the temporal
 	// history on the first evaluated frame.
-	SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 1);
+	SetCommonParams(style, preset, intensity, tone, structure, skin, automask, ui_correction, 1, temporal);
 
 	NGXResult r;
 	if (g_nr_create && g_shim_create)
@@ -649,6 +782,7 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
 	g_feature_style = style;
 	g_feature_preset = preset;
 	g_feature_ui_correction = ui_correction;
+	g_feature_motion = motion_key;
 	return true;
 }
 
@@ -776,6 +910,9 @@ static void ShutdownUnlocked()
 {
 	ReleaseFeatureAndResources();
 	ReleaseSharedState();
+	// The OFA session is driver state but not NGX/D3D12-UMD state; the public
+	// NVOF API owns its teardown and nvofapi64.dll is safe to unload.
+	NvofShutdown();
 	if (g_core_shutdown)
 		g_core_shutdown();
 	g_params = nullptr;
@@ -784,12 +921,12 @@ static void ShutdownUnlocked()
 	g_cmd_alloc.Reset();
 	g_cmd.Reset();
 	g_fence.Reset();
-	if (g_shim_mod)
-		FreeLibrary(g_shim_mod);
-	if (g_nr_mod)
-		FreeLibrary(g_nr_mod);
-	if (g_core_mod)
-		FreeLibrary(g_core_mod);
+	// The NGX core and the NR runtime own driver worker threads and live D3D12
+	// state. Unloading them here deadlocks inside the NVIDIA D3D12 UMD:
+	// FreeLibrary(g_nr_mod) never returns, which wedges the OBS destroy queue
+	// that dlss5nr_destroy runs on, and OBS then hangs on exit waiting in
+	// obs_wait_for_destroy_queue. Leave them mapped and let process teardown
+	// reclaim them; a later init reloads them and reuses the mapped image.
 	g_shim_mod = g_nr_mod = g_core_mod = nullptr;
 
 	g_core_init_ext = nullptr;
@@ -866,6 +1003,7 @@ bool init(int gpu_index, const wchar_t *runtime_dir, const wchar_t *shim_dir)
 
 	g_gpu_index = gpu_index;
 	g_runtime_dir = runtime_dir;
+	g_adapter = FindAdapter(gpu_index);
 	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
 	if (!g_lut8_ready) {
@@ -907,13 +1045,36 @@ bool process(const uint8_t *src_bgra, int src_row_pitch, uint8_t *dst_bgra, int 
 		return false;
 	}
 
+	// Temporal mode needs the CPU staging path: the zero-copy path never has
+	// pixels on the CPU to feed the optical-flow estimator.
+	const bool temporal = params.temporal != 0 && !g_gpu_mode;
+	if (!temporal)
+		// Still mode owns no temporal history or OFA resources; this also
+		// releases OFA VRAM when the user switches temporal back off.
+		NvofReleaseSession();
+
 	if (!EnsureFeature(static_cast<UINT>(width), static_cast<UINT>(height), params.style, params.preset,
 			   params.intensity, params.tone, params.structure, params.skin, params.automask,
-			   params.ui_correction)) {
+			   params.ui_correction, temporal)) {
 		return false;
 	}
+
+	if (temporal) {
+		NvofFlowFrame flow;
+		std::string of_error;
+		if (!NvofPrepareFrame(g_adapter.Get(), src_bgra, src_row_pitch, static_cast<UINT>(width),
+				      static_cast<UINT>(height), params.reset != 0, flow, of_error)) {
+			SetError("%s", of_error.c_str());
+			return false;
+		}
+		// First frame: no previous frame exists, so this deliberately writes
+		// zero MVs. Later frames upload NVOFA current->previous optical flow.
+		if (!UploadMotionVectorTexture(flow.has_flow ? &flow : nullptr, false))
+			return false;
+	}
+
 	SetCommonParams(params.style, params.preset, params.intensity, params.tone, params.structure, params.skin,
-			params.automask, params.ui_correction, params.reset ? 1 : 0);
+			params.automask, params.ui_correction, params.reset ? 1 : 0, temporal);
 
 	// Pack BGRA8 input into the RGBA16F upload buffer. Row padding is never
 	// read by footprint copies, so it is left untouched.
@@ -1169,11 +1330,12 @@ bool process_gpu(int width, int height, const NrBridgeParams &params)
 	}
 
 	if (!EnsureFeature(g_shared_w, g_shared_h, params.style, params.preset, params.intensity, params.tone,
-			   params.structure, params.skin, params.automask, params.ui_correction)) {
+			   params.structure, params.skin, params.automask, params.ui_correction,
+			   /*temporal=*/false)) {
 		return false;
 	}
 	SetCommonParams(params.style, params.preset, params.intensity, params.tone, params.structure, params.skin,
-			params.automask, params.ui_correction, params.reset ? 1 : 0);
+			params.automask, params.ui_correction, params.reset ? 1 : 0, /*temporal=*/false);
 
 	// 1) Helper D3D11: copy the OBS-rendered frame into the D3D12-visible
 	// relay texture. The keyed mutex (when present) orders this against the

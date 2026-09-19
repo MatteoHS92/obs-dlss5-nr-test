@@ -19,6 +19,9 @@ struct NrBridgeParams {
 	int automask;
 	int ui_correction;
 	int reset;
+	// Temporal mode: estimate per-frame motion vectors with NVIDIA Optical Flow
+	// and feed them to DLSS NR. Requires the CPU staging path.
+	int temporal;
 };
 
 namespace nrbridge {

@@ -5,10 +5,11 @@
 > ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
 > This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Features (v1.1.0)
+## Features (v1.2.0)
 
 - DLSS 5 Neural Rendering on any OBS video source, live
 - **Style**: Default / Natural / Cinematic (rebuilds the NR feature on change)
+- **Temporal Mode** — estimates per-frame motion vectors with NVIDIA Optical Flow (NVOFA, driver-provided) and feeds them to DLSS NR for better temporal stability and less ghosting on movement (CPU staging path only)
 - **Render Preset** (0–3), **Intensity**, **Local Tone**, **Local Structure**, **Skin Structure** sliders — applied per-frame
 - **Auto Mask**
 - **Processing Mode**:
@@ -16,14 +17,15 @@
   - *Low latency* — inline processing for game capture where delay matters
 - **NR Frame Rate** throttle — Match source / 60 / 30 / 24 / 15 fps; between NR frames the last enhanced frame is displayed (a performance dial)
 - **Reset History** button (fixes smearing after scene cuts)
+- Clean shutdown — the NGX modules are left mapped for process lifetime (unloading them deadlocked inside the NVIDIA D3D12 driver); OBS exits normally
 - Advanced: GPU Index, Channel Order (auto-detects runtime BGRA/RGBA quirks), experimental zero-copy toggle (off by default — see status)
 - Fail-safe design: any NGX/runtime error falls back to clean pass-through video and is reported in the filter's Status line
 
 ## Current status
 
 - ✅ Stable NR processing (CPU-staged) — recommended
+- ✅ Temporal mode: NVIDIA Optical Flow motion vectors (better stability on movement; CPU path only, not available with zero-copy GPU mode)
 - ⚠️ Zero-copy GPU path: experimental, **off by default**. The NR runtime currently aborts the process when writing into D3D11-shared textures at 4K. Enable only for testing.
-- ❌ Motion vectors: NR runs per-frame (no temporal flow yet) — planned
 
 ## Requirements
 

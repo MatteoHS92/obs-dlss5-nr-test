@@ -21,8 +21,11 @@ on [obsproject/obs-plugintemplate](https://github.com/obsproject/obs-plugintempl
 
 ## src/bridge — MIT-licensed portions
 
-`src/bridge/caller_shim.cpp` and portions of `src/bridge/nr_bridge.cpp` are
+`src/bridge/caller_shim.cpp`, `src/bridge/nvof_flow.cpp`, and portions of
+`src/bridge/nr_bridge.cpp` are
 adapted from [lisitskyaa/ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR).
+The NVOF D3D11 function-table integration follows the MIT-licensed
+[NIGos/dlss5-bridge](https://github.com/NIGos/dlss5-bridge).
 
 MIT License — Copyright (c) 2026 ComfyUI-DLSS5-NR contributors.
 
