@@ -65,3 +65,10 @@ if(OS_WINDOWS)
 endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+option(ENABLE_PERFORMANCE_TESTS "Build frame policy tests and the manual OBS GPU smoke test" OFF)
+option(ENABLE_GPU_SMOKE_TEST "Build the manual smoke test (requires an installed OBS and DLSS runtime)" OFF)
+if(ENABLE_PERFORMANCE_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

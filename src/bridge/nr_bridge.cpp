@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cmath>
 #include <cstdint>
@@ -106,7 +107,7 @@ static std::string g_last_error;
 static std::string g_gpu_name = "unknown";
 static std::wstring g_runtime_dir;
 static int g_gpu_index = 0;
-static bool g_initialized = false;
+static std::atomic<bool> g_initialized{false};
 
 static HMODULE g_core_mod = nullptr;
 static HMODULE g_nr_mod = nullptr;
@@ -1414,8 +1415,9 @@ void shutdown()
 
 bool ready()
 {
-	std::lock_guard<std::mutex> guard(g_mutex);
-	return g_initialized;
+	// The graphics thread polls this while the worker holds g_mutex across
+	// inference and GPU waits. Readiness must never wait for a processed frame.
+	return g_initialized.load(std::memory_order_acquire);
 }
 
 const char *gpu_name()

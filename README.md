@@ -5,7 +5,7 @@
 > ⚠️ **Windows x64 + NVIDIA RTX only.** Linux/macOS builds compile as no-ops.
 > This project is not affiliated with, endorsed by, or supported by NVIDIA or the OBS Project. It targets an undocumented, pre-release interface; behavior may change with NVIDIA driver or `nvngx_dlssnr.dll` versions.
 
-## Features (v1.2.0)
+## Features (v1.2.5)
 
 - DLSS 5 Neural Rendering on any OBS video source, live
 - **Style**: Default / Natural / Cinematic (rebuilds the NR feature on change)
@@ -13,13 +13,35 @@
 - **Render Preset** (0–3), **Intensity**, **Local Tone**, **Local Structure**, **Skin Structure** sliders — applied per-frame
 - **Auto Mask**
 - **Processing Mode**:
-  - *Smooth* (default) — NR runs on a worker thread one frame behind; OBS keeps full frame rate
-  - *Low latency* — inline processing for game capture where delay matters
-- **NR Frame Rate** throttle — Match source / 60 / 30 / 24 / 15 fps; between NR frames the last enhanced frame is displayed (a performance dial)
+  - *Smooth* (default) — NR runs on a worker thread; completed frames repeat until a new result is ready. Latency and enhanced FPS depend on processing speed.
+  - *Low latency* — inline processing; waits block the OBS render thread.
+- **Processing Resolution** dropdown — Source / 2160p / 1440p / **1080p (default)** / 720p. Resizes on the GPU before NR, preserving aspect ratio and the original displayed source size. Smaller sources are not enlarged.
+- **Live performance status** — actual enhanced FPS, processing dimensions, path, and last processing time in the Status field and periodic OBS logs. Reopen filter properties to refresh the Status snapshot.
+- **NR Frame Rate** throttle — Match source / 60 / 30 / 24 / 15 fps in both processing modes; between NR frames the last enhanced frame is displayed (a performance dial)
 - **Reset History** button (fixes smearing after scene cuts)
 - Clean shutdown — the NGX modules are left mapped for process lifetime (unloading them deadlocked inside the NVIDIA D3D12 driver); OBS exits normally
 - Advanced: GPU Index, Channel Order (auto-detects runtime BGRA/RGBA quirks), experimental zero-copy toggle (off by default — see status)
 - Fail-safe design: any NGX/runtime error falls back to clean pass-through video and is reported in the filter's Status line
+
+## Faster processing in 1.2.5
+
+Start with **Smooth + 1080p + Temporal off**. For Temporal Mode, try **Smooth + 720p**. Existing mode and Temporal choices are retained when upgrading; the new processing-resolution default is 1080p.
+
+The filter works at the source's dimensions before OBS's output scaling. A 4K camera can therefore cost 4K processing even with a 1080p stream. The new dropdown reduces the frame *before* CPU staging and neural rendering; choosing 1080p for a 4K source cuts the processed pixel count by 75%. Lower resolutions trade fine detail for speed.
+
+Smooth mode's readiness check no longer waits on the worker's processing mutex. The frame limiter preserves its timing schedule through small clock variations, avoiding the old 30-to-15 FPS drop. Duplicate renders reuse completed output, and changing mode/resolution clears stale frames. Smooth mode still uses CPU staging; the experimental GPU-sharing path is only used in Low latency mode.
+
+**OBS FPS is not enhanced FPS.** OBS may output 30 frames/sec while repeating slower NR results. Check the new enhanced-FPS status for the effective update rate.
+
+Measured with the real OBS renderer and NR runtime on an RTX 5090, using an animated 4K synthetic source at 30 FPS, after five seconds of warm-up:
+
+| Processing settings | Enhanced FPS | Missed OBS render frames in 10 seconds |
+| --- | ---: | ---: |
+| Smooth, 1080p, Temporal off | 30.0 | 0 |
+| Smooth, 1080p, Temporal on | 20.9 | 0 |
+| Smooth, 720p, Temporal on | 30.0 | 0 |
+
+These measurements are specific to this test, not a promise for every camera, scene, model, or GPU. See [1.2.5 patch notes](docs/releases/1.2.5.md) and [test instructions](tests/README.md).
 
 ## Current status
 
@@ -85,6 +107,8 @@ The NGX core (`_nvngx.dll`) is not copied by hand — the plugin discovers it au
 
 DLSS NR support is decided by the `nvngx_dlssnr.dll` build you supply — the plugin relays the runtime's verdict to the Status line and falls back to clean pass-through video when a GPU is rejected.
 
+The release is **one generic Windows x64 ZIP** for all runtime-supported RTX GPUs, with no 5090-only compiler target or GPU-generation allowlist. Only the RTX 5090 was hardware-tested for 1.2.5; support on other generations remains dependent on NVIDIA's runtime and driver.
+
 The community-standard **310.8 runtime** (the build everyone ships, including the DLSS5-Swapper project) reports support across the full RTX lineup:
 
 | GPU | Status |
@@ -110,7 +134,7 @@ Non-Windows platforms build an empty module (the filter only registers on `_WIN3
 
 ## Releases
 
-Tags using semantic versioning (e.g. `v1.1.0`) trigger the GitHub Actions release workflow, which builds Windows x64 packages and creates a release. See `docs/RELEASING.md`.
+Semantic-version tags (for example `1.2.5`) trigger the Windows-only build and regression tests. The release workflow uses **curl** to create a draft with versioned patch notes and a checksum, attaching only the Windows x64 ZIP. The ZIP includes the README, license, and patch notes. GitHub also displays its automatic source-code links. See [release instructions](docs/RELEASING.md).
 
 ## License
 

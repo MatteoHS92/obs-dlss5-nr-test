@@ -7,12 +7,9 @@
 // (at your option) any later version.
 //
 // Runs video frames through NVIDIA DLSS NR (NGX feature 18) on a private
-// D3D12 device. Primary path is zero-copy: the filter renders the source into
-// a keyed-mutex shared texture, a helper D3D11 relay hands it to D3D12/NGX,
-// and the result comes back as another shared texture the filter draws —
-// no pixel touches the CPU. If shared textures are unavailable the filter
-// falls back to CPU staging. Any bridge failure falls back to clean
-// pass-through video — the stream never stops.
+// D3D12 device. The default path stages pixels through the CPU, with NR on
+// a worker thread. The experimental shared-texture path is opt-in and only
+// used in Low latency mode. Frames can be resized on the GPU before staging.
 
 #include "dlss5-nr-filter.h"
 
@@ -32,6 +29,7 @@
 #include <vector>
 
 #include "bridge/nr_bridge.h"
+#include "frame-policy.h"
 
 // DLSSNR.Style values, as consumed by nvngx_dlssnr (NGX feature 18).
 enum DlssNrStyle {
@@ -83,9 +81,16 @@ struct dlss5nr_filter {
 	bool using_gpu = false;
 	bool gpu_broken = false;    // set when shared-texture setup fails; avoid per-frame retry
 	bool gpu_zero_copy = false; // user opt-in; experimental
-	bool async_mode = true;     // "Smooth": NR on worker thread, +1 frame latency
+	bool async_mode = true;     // "Smooth": NR on worker thread, variable latency
 	uint32_t nr_fps = 0;        // 0 = process every frame; else throttle NR to N fps
-	uint64_t last_submit_ns = 0;
+	frame_policy::RateLimiter limiter;
+	uint32_t processing_height = 1080;
+	uint32_t source_w = 0, source_h = 0;
+	uint64_t last_render_ns = 0;
+	bool cached_frame = false;
+	uint64_t perf_start_ns = 0;
+	uint32_t presented_frames = 0;
+	std::atomic<double> process_ms{0.0};
 
 	// Async machinery (Smooth mode). The graphics thread only snapshots
 	// frames into jobs and draws the newest completed result; a worker
@@ -149,9 +154,13 @@ static void async_worker(dlss5nr_filter *f)
 		}
 
 		std::vector<uint8_t> out((size_t)job.w * job.h * 4);
+		const uint64_t begin_ns = os_gettime_ns();
 		const bool ok = nrbridge::process(job.pixels.data(), (int)job.pitch, out.data(), (int)job.w * 4,
 						  (int)job.w, (int)job.h, job.params);
 
+		f->process_ms.store((os_gettime_ns() - begin_ns) / 1000000.0);
+		if (!ok)
+			f->set_status("NR failed: %s", nrbridge::last_error());
 		std::lock_guard<std::mutex> lock(f->result_mutex);
 		if (ok) {
 			f->result.pixels = std::move(out);
@@ -181,6 +190,26 @@ static void stop_worker(dlss5nr_filter *f)
 	if (f->worker.joinable())
 		f->worker.join();
 	f->worker_started = false;
+}
+
+static void clear_completed_frames(dlss5nr_filter *f)
+{
+	// Caller stops the worker before invalidating results or processing dimensions.
+	{
+		std::lock_guard<std::mutex> lock(f->job_mutex);
+		f->jobs.clear();
+	}
+	{
+		std::lock_guard<std::mutex> lock(f->result_mutex);
+		f->result_valid = false;
+		f->result.pixels.clear();
+	}
+	f->drawn_seq = 0;
+	f->cached_frame = false;
+	f->last_render_ns = 0;
+	f->limiter.reset();
+	f->perf_start_ns = 0;
+	f->presented_frames = 0;
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -443,6 +472,8 @@ static bool ensure_cpu_surfaces(dlss5nr_filter *f, uint32_t cx, uint32_t cy)
 	if (f->stagesurface && f->out_tex && f->shared_w == cx && f->shared_h == cy)
 		return true;
 
+	stop_worker(f);
+	clear_completed_frames(f);
 	obs_enter_graphics();
 	destroy_cpu_surfaces(f);
 	f->stagesurface = gs_stagesurface_create(cx, cy, GS_BGRA);
@@ -476,16 +507,18 @@ static void render_parent_into(dlss5nr_filter *f, obs_source_t *parent, uint32_t
 	gs_viewport_push();
 	gs_projection_push();
 
+	gs_texture_t *previous_target = gs_get_render_target();
+	gs_zstencil_t *previous_zs = gs_get_zstencil_target();
 	gs_set_render_target(f->shared_in, nullptr);
 	gs_set_viewport(0, 0, (int)cx, (int)cy);
-	gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+	gs_ortho(0.0f, (float)f->source_w, 0.0f, (float)f->source_h, -100.0f, 100.0f);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 	obs_source_video_render(parent);
 	gs_blend_state_pop();
 
-	gs_set_render_target(nullptr, nullptr);
+	gs_set_render_target(previous_target, previous_zs);
 
 	gs_projection_pop();
 	gs_viewport_pop();
@@ -550,7 +583,7 @@ static GpuResult process_gpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_s
 		}
 	}
 
-	draw_texture(f->shared_out, cx, cy);
+	draw_texture(f->shared_out, f->source_w, f->source_h);
 	return GpuResult::Ok;
 }
 
@@ -569,7 +602,7 @@ static bool process_cpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 
 	bool grabbed = false;
 	if (gs_texrender_begin(f->texrender, cx, cy)) {
-		gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+		gs_ortho(0.0f, (float)f->source_w, 0.0f, (float)f->source_h, -100.0f, 100.0f);
 		obs_source_video_render(parent);
 		gs_texrender_end(f->texrender);
 		grabbed = true;
@@ -611,14 +644,15 @@ static bool process_cpu_path(dlss5nr_filter *f, obs_source_t *parent, obs_source
 	}
 
 	gs_texture_set_image(f->out_tex, f->out_buf.data(), cx * 4, false);
-	draw_texture(f->out_tex, cx, cy);
+	draw_texture(f->out_tex, f->source_w, f->source_h);
 	return true;
 }
 // Smooth mode: snapshot this frame into a job, then draw the newest
 // completed result (or pass through until the first result exists).
 // nr_fps throttles how often frames are submitted for processing; between
 // submissions the last NR'd frame keeps displaying.
-static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx, uint32_t cy)
+static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_source_t *context, uint32_t cx, uint32_t cy,
+			       bool submit)
 {
 	UNUSED_PARAMETER(context);
 	if (!f->texrender)
@@ -626,16 +660,7 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 	if (!ensure_cpu_surfaces(f, cx, cy))
 		return false;
 
-	bool submit = true;
-	if (f->nr_fps > 0) {
-		const uint64_t now = os_gettime_ns();
-		const uint64_t interval_ns = 1000000000ULL / f->nr_fps;
-		if (now - f->last_submit_ns < interval_ns) {
-			submit = false;
-		} else {
-			f->last_submit_ns = now;
-		}
-	}
+	start_worker(f);
 
 	bool grabbed = false;
 	if (submit) {
@@ -645,7 +670,7 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
 		if (gs_texrender_begin(f->texrender, cx, cy)) {
-			gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+			gs_ortho(0.0f, (float)f->source_w, 0.0f, (float)f->source_h, -100.0f, 100.0f);
 			obs_source_video_render(parent);
 			gs_texrender_end(f->texrender);
 			grabbed = true;
@@ -684,13 +709,13 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 
 				{
 					std::lock_guard<std::mutex> lock(f->job_mutex);
-					if (f->jobs.size() >= 2)
-						f->jobs.pop_front();
+					if (!f->jobs.empty() && f->jobs.back().params.reset)
+						job.params.reset =
+							1; // Don't drop a pending history reset with a stale frame.
+					f->jobs.clear();   // Keep only the newest pending frame.
 					f->jobs.push_back(std::move(job));
 				}
 				f->job_cv.notify_one();
-			} else {
-				gs_stagesurface_unmap(f->stagesurface);
 			}
 		}
 	}
@@ -711,9 +736,11 @@ static bool process_async_path(dlss5nr_filter *f, obs_source_t *parent, obs_sour
 	if (f->drawn_seq == 0)
 		return false; // nothing processed yet — brief pass-through at start
 
-	if (new_result)
+	if (new_result) {
 		gs_texture_set_image(f->out_tex, f->draw_buf.data(), cx * 4, false);
-	draw_texture(f->out_tex, cx, cy);
+		++f->presented_frames;
+	}
+	draw_texture(f->out_tex, f->source_w, f->source_h);
 	return true;
 }
 
@@ -723,45 +750,77 @@ static void dlss5nr_video_render(void *data, gs_effect_t *filter_effect)
 	auto *f = static_cast<dlss5nr_filter *>(data);
 	obs_source_t *context = f->context;
 	obs_source_t *parent = obs_filter_get_parent(context);
-
-	const uint32_t cx = parent ? obs_source_get_base_width(parent) : 0;
-	const uint32_t cy = parent ? obs_source_get_base_height(parent) : 0;
-	if (!parent || cx == 0 || cy == 0) {
+	f->source_w = parent ? obs_source_get_base_width(parent) : 0;
+	f->source_h = parent ? obs_source_get_base_height(parent) : 0;
+	if (!f->source_w || !f->source_h) {
 		obs_source_skip_video_filter(context);
 		return;
 	}
-
-	const bool bridge_ready = ensure_bridge_ready(f);
-	bool processed = false;
-
-	if (bridge_ready) {
-		if (f->async_mode) {
-			// Smooth mode: worker thread owns the bridge. The
-			// experimental zero-copy path is incompatible with it
-			// (mutually exclusive bridge modes).
-			start_worker(f);
-			processed = process_async_path(f, parent, context, cx, cy);
-		} else if (f->gpu_zero_copy && gs_shared_texture_available()) {
-			switch (process_gpu_path(f, parent, context, cx, cy)) {
-			case GpuResult::Ok:
-				processed = true;
-				break;
-			case GpuResult::Skip:
-				break; // pass through this frame; GPU mode stays attached
-			case GpuResult::Broken:
-				// Surfaces are detached now; CPU staging is safe again.
-				processed = process_cpu_path(f, parent, context, cx, cy);
-				break;
-			}
-		} else {
-			processed = process_cpu_path(f, parent, context, cx, cy);
-		}
+	const auto size = frame_policy::processing_size(f->source_w, f->source_h, f->processing_height);
+	const uint32_t cx = size.width, cy = size.height;
+	const uint64_t now = obs_get_video_frame_time();
+	const bool duplicate = now == f->last_render_ns;
+	const bool resized = cx != f->shared_w || cy != f->shared_h;
+	if (resized) {
+		f->cached_frame = false;
+		f->limiter.reset();
+	}
+	if (duplicate && !resized) {
+		if (f->cached_frame)
+			draw_texture(f->using_gpu ? f->shared_out : f->out_tex, f->source_w, f->source_h);
+		else
+			obs_source_skip_video_filter(context);
+		return;
 	}
 
-	if (!processed) {
-		if (f->reset_pending)
-			f->reset_pending = false;
+	bool processed = false;
+	if (ensure_bridge_ready(f)) {
+		const bool submit = f->limiter.due(now, f->nr_fps);
+		if (f->async_mode) {
+			processed = process_async_path(f, parent, context, cx, cy, submit);
+		} else if (!submit && f->cached_frame) {
+			draw_texture(f->using_gpu ? f->shared_out : f->out_tex, f->source_w, f->source_h);
+			processed = true;
+		} else {
+			const uint64_t begin_ns = os_gettime_ns();
+			if (f->gpu_zero_copy && gs_shared_texture_available()) {
+				switch (process_gpu_path(f, parent, context, cx, cy)) {
+				case GpuResult::Ok:
+					processed = true;
+					break;
+				case GpuResult::Skip:
+					break;
+				case GpuResult::Broken:
+					processed = process_cpu_path(f, parent, context, cx, cy);
+					break;
+				}
+			} else {
+				processed = process_cpu_path(f, parent, context, cx, cy);
+			}
+			f->process_ms.store((os_gettime_ns() - begin_ns) / 1000000.0);
+			if (processed)
+				++f->presented_frames;
+		}
+	}
+	f->last_render_ns = now;
+	f->cached_frame = processed;
+	if (!processed)
 		obs_source_skip_video_filter(context);
+
+	if (!f->perf_start_ns)
+		f->perf_start_ns = now;
+	if (now - f->perf_start_ns >= LOG_THROTTLE_NS) {
+		const double fps = f->presented_frames * 1000000000.0 / (now - f->perf_start_ns);
+		if (f->presented_frames) {
+			char perf[256];
+			snprintf(perf, sizeof(perf), "%s | %s | NR %ux%u | enhanced %.1f FPS | last processing %.1f ms",
+				 f->using_gpu ? "GPU sharing" : "CPU staging", f->async_mode ? "Smooth" : "Low latency",
+				 cx, cy, fps, f->process_ms.load());
+			f->set_status("%s", perf);
+			blog(LOG_INFO, "[obs-dlss5-nr] %s", perf);
+		}
+		f->presented_frames = 0;
+		f->perf_start_ns = now;
 	}
 }
 
@@ -789,17 +848,30 @@ static void dlss5nr_update(void *data, obs_data_t *settings)
 	f->gpu_index = (int)obs_data_get_int(settings, "gpu_index");
 	f->channel_order = (int)obs_data_get_int(settings, "channel_order");
 	const bool new_async = obs_data_get_bool(settings, "async_mode");
-	if (f->initialized && f->async_mode && !new_async)
-		stop_worker(f); // realtime mode takes over the bridge directly
-	f->async_mode = new_async;
-	f->nr_fps = (uint32_t)obs_data_get_int(settings, "nr_fps");
-	if (f->nr_fps && f->last_submit_ns == 0)
-		f->last_submit_ns = os_gettime_ns() - 1000000000ULL; // submit immediately on first gated frame
-	f->gpu_zero_copy = obs_data_get_bool(settings, "gpu_zero_copy");
-	if (!f->gpu_zero_copy && f->using_gpu) {
-		destroy_gpu_surfaces(f);
+	const bool new_gpu = obs_data_get_bool(settings, "gpu_zero_copy");
+	uint32_t new_height = (uint32_t)obs_data_get_int(settings, "processing_height");
+	if (new_height != 0 && new_height != 720 && new_height != 1080 && new_height != 1440 && new_height != 2160)
+		new_height = 1080;
+	const bool path_changed = f->async_mode != new_async || f->gpu_zero_copy != new_gpu ||
+				  f->processing_height != new_height;
+	if (path_changed) {
+		stop_worker(f);
+		clear_completed_frames(f);
+		obs_enter_graphics();
+		if (f->using_gpu)
+			destroy_gpu_surfaces(f);
+		// Dimensions are shared between CPU/GPU paths, so discard both on a switch.
+		destroy_cpu_surfaces(f);
+		f->shared_w = f->shared_h = 0;
+		obs_leave_graphics();
 		f->gpu_broken = false;
 	}
+	f->async_mode = new_async;
+	f->gpu_zero_copy = new_gpu;
+	f->processing_height = new_height;
+	f->nr_fps = (uint32_t)obs_data_get_int(settings, "nr_fps");
+	if (f->nr_fps != 0 && f->nr_fps != 15 && f->nr_fps != 24 && f->nr_fps != 30 && f->nr_fps != 60)
+		f->nr_fps = 0;
 	f->initialized = true;
 }
 
@@ -875,6 +947,16 @@ static obs_properties_t *dlss5nr_properties(void *data)
 	obs_property_list_add_bool(mode, obs_module_text("ProcessingMode.Realtime"), false);
 	obs_property_set_long_description(mode, obs_module_text("ProcessingMode.Tip"));
 
+	obs_property_t *resolution = obs_properties_add_list(props, "processing_height",
+							     obs_module_text("ProcessingResolution"),
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(resolution, obs_module_text("ProcessingResolution.Source"), 0);
+	obs_property_list_add_int(resolution, "2160p (up to 3840 x 2160)", 2160);
+	obs_property_list_add_int(resolution, "1440p (up to 2560 x 1440)", 1440);
+	obs_property_list_add_int(resolution, "1080p (up to 1920 x 1080)", 1080);
+	obs_property_list_add_int(resolution, "720p (up to 1280 x 720)", 720);
+	obs_property_set_long_description(resolution, obs_module_text("ProcessingResolution.Tip"));
+
 	obs_property_t *nr_fps = obs_properties_add_list(props, "nr_fps", obs_module_text("NRFps"), OBS_COMBO_TYPE_LIST,
 							 OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(nr_fps, obs_module_text("NRFps.Source"), 0);
@@ -904,6 +986,7 @@ static void dlss5nr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "gpu_zero_copy", false);
 	obs_data_set_default_bool(settings, "async_mode", true);
 	obs_data_set_default_int(settings, "nr_fps", 0);
+	obs_data_set_default_int(settings, "processing_height", 1080);
 	obs_data_set_default_int(settings, "channel_order", DLSSNR_CHANNEL_AUTO);
 	obs_data_set_default_string(settings, "status", "");
 }

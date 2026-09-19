@@ -1,119 +1,74 @@
 name: Push
-run-name: ${{ github.ref_name }} push run 🚀
+run-name: ${{ github.ref_name }} build
 on:
   push:
-    branches:
-      - master
-      - main
-      - 'release/**'
-    tags:
-      - '*'
+    branches: [master, main, 'release/**']
+    tags: ['*']
 permissions:
-  contents: write
+  contents: read
 jobs:
   check-format:
-    name: Check Formatting 🔍
-    if: github.ref_name == 'master' || github.ref_name == 'main'
+    name: Check Formatting
     uses: ./.github/workflows/check-format.yaml
-    permissions:
-      contents: read
-
   build-project:
-    name: Build Project 🧱
+    name: Build Windows ZIP
     uses: ./.github/workflows/build-project.yaml
-    secrets: inherit
-    permissions:
-      contents: read
-
   create-release:
-    name: Create Release 🛫
+    name: Create Windows release with patch notes
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    needs: build-project
-    defaults:
-      run:
-        shell: bash
+    needs: [check-format, build-project]
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PLUGIN_VERSION: ${{ needs.build-project.outputs.pluginVersion }}
     steps:
-      - name: Check Release Tag ☑️
-        id: check
-        run: |
-          : Check Release Tag ☑️
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-
-          case "${GITHUB_REF_NAME}" in
-            +([0-9]).+([0-9]).+([0-9]) )
-              echo 'validTag=true' >> $GITHUB_OUTPUT
-              echo 'prerelease=false' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-              ;;
-            +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
-              echo 'validTag=true' >> $GITHUB_OUTPUT
-              echo 'prerelease=true' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-              ;;
-            *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
-          esac
-
-      - name: Download Build Artifacts 📥
-        uses: actions/download-artifact@v4
-        if: fromJSON(steps.check.outputs.validTag)
-        id: download
-
-      - name: Rename Files 🏷️
-        if: fromJSON(steps.check.outputs.validTag)
-        run: |
-          : Rename Files 🏷️
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-          shopt -s nullglob
-
-          root_dir="$(pwd)"
-          commit_hash="${GITHUB_SHA:0:9}"
-
-          variants=(
-            'windows-x64;zip|exe'
-            'macos-universal;tar.xz|pkg'
-            'ubuntu-24.04-x86_64;tar.xz|deb|ddeb'
-            'sources;tar.xz'
-          )
-
-          for variant_data in "${variants[@]}"; do
-            IFS=';' read -r variant suffix <<< "${variant_data}"
-
-            candidates=(*-${variant}-${commit_hash}/@(*|*-dbgsym).@(${suffix}))
-
-            for candidate in "${candidates[@]}"; do
-              mv "${candidate}" "${root_dir}"
-            done
-          done
-
-      - name: Generate Checksums 🪪
-        if: fromJSON(steps.check.outputs.validTag)
-        run: |
-          : Generate Checksums 🪪
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-
-          echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
-          for file in ${{ github.workspace }}/@(*.exe|*.deb|*.ddeb|*.pkg|*.tar.xz|*.zip); do
-            echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
-          done
-
-      - name: Create Release 🛫
-        if: fromJSON(steps.check.outputs.validTag)
-        id: create_release
-        uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          draft: true
-          prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
-          tag_name: ${{ steps.check.outputs.version }}
-          name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
-          body_path: ${{ github.workspace }}/CHECKSUMS.txt
-          files: |
-            ${{ github.workspace }}/*.exe
-            ${{ github.workspace }}/*.zip
-            ${{ github.workspace }}/*.pkg
-            ${{ github.workspace }}/*.deb
-            ${{ github.workspace }}/*.ddeb
-            ${{ github.workspace }}/*.tar.xz
+          name: obs-dlss5-nr-${{ env.PLUGIN_VERSION }}-windows-x64
+          path: release-assets
+      - name: Validate tag, asset and patch notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME#v}" = "$PLUGIN_VERSION"
+          test -s "docs/releases/$PLUGIN_VERSION.md"
+          asset="release-assets/obs-dlss5-nr-$PLUGIN_VERSION-windows-x64.zip"
+          test -s "$asset"
+          test "$(find release-assets -type f | wc -l)" -eq 1
+          cp "docs/releases/$PLUGIN_VERSION.md" release-body.md
+          printf '\n## SHA-256\n\n`%s`\n' "$(sha256sum "$asset" | cut -d ' ' -f 1)" >> release-body.md
+      - name: Create draft and upload only the Windows ZIP using curl
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          headers=(-H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
+          jq -n --arg tag "$GITHUB_REF_NAME" --arg name "DLSS 5 Neural Rendering $PLUGIN_VERSION" \
+            --rawfile body release-body.md \
+            '{tag_name:$tag,name:$name,body:$body,draft:true,prerelease:($tag|test("-(beta|rc)"))}' > release.json
+          status=$(curl --silent --show-error "${headers[@]}" -o existing.json -w '%{http_code}' "$api/releases/tags/$GITHUB_REF_NAME")
+          if [[ "$status" == 404 ]]; then
+            curl --fail-with-body --silent --show-error "${headers[@]}" -H 'Content-Type: application/json' \
+              --data-binary @release.json "$api/releases" -o created.json
+          elif [[ "$status" == 200 ]] && [[ "$(jq -r .draft existing.json)" == true ]]; then
+            id=$(jq -r .id existing.json)
+            # Only a draft owned by this release is refreshed on a workflow retry.
+            jq -e --arg asset "obs-dlss5-nr-$PLUGIN_VERSION-windows-x64.zip" 'all(.assets[]; .name == $asset)' existing.json
+            for asset_id in $(jq -r '.assets[].id' existing.json); do
+              curl --fail-with-body --silent --show-error "${headers[@]}" -X DELETE "$api/releases/assets/$asset_id"
+            done
+            curl --fail-with-body --silent --show-error "${headers[@]}" -X PATCH -H 'Content-Type: application/json' \
+              --data-binary @release.json "$api/releases/$id" -o created.json
+          else
+            echo 'Release lookup failed or tag already has a published release; refusing to overwrite it.' >&2
+            exit 1
+          fi
+          id=$(jq -r .id created.json)
+          asset="obs-dlss5-nr-$PLUGIN_VERSION-windows-x64.zip"
+          curl --fail-with-body --silent --show-error "${headers[@]}" -H 'Content-Type: application/zip' \
+            --data-binary "@release-assets/$asset" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$asset" -o uploaded.json
+          jq -e --arg name "$asset" '.name == $name and .state == "uploaded"' uploaded.json
