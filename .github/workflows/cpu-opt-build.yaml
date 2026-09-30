@@ -1,0 +1,70 @@
+name: CPU-OPT Windows Build
+
+on:
+  push:
+    branches: [cpu-opt]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build CPU-OPT Windows x64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Decode and apply CPU-OPT patch
+        run: |
+          $b64 = (Get-Content cpu-opt.patch.gz.b64 -Raw).Trim()
+          $gzBytes = [Convert]::FromBase64String($b64)
+          [IO.File]::WriteAllBytes('cpu-opt.patch.gz', $gzBytes)
+          $in = [IO.File]::OpenRead('cpu-opt.patch.gz')
+          $gz = New-Object IO.Compression.GZipStream($in, [IO.Compression.CompressionMode]::Decompress)
+          $out = [IO.File]::Create('cpu-opt.patch')
+          $gz.CopyTo($out)
+          $out.Dispose(); $gz.Dispose(); $in.Dispose()
+          git apply --check cpu-opt.patch
+          git apply cpu-opt.patch
+          git diff --check
+          git diff --stat
+
+      - name: Configure Release build
+        run: cmake --preset windows-ci-x64 -DENABLE_PERFORMANCE_TESTS=ON -DENABLE_GPU_SMOKE_TEST=OFF
+
+      - name: Build Release
+        run: cmake --build --preset windows-x64 --config Release --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build_x64 -C Release --output-on-failure
+
+      - name: Stage plugin
+        run: cmake --install build_x64 --prefix release/Release --config Release
+
+      - name: Package CPU-OPT ZIP
+        run: |
+          $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
+          $package = "release/Release/$($spec.name)"
+          if (!(Test-Path $package)) { throw "Missing install package: $package" }
+          $dll = Get-ChildItem $package -Recurse -Filter 'obs-dlss5-nr.dll' | Select-Object -First 1
+          if (!$dll) { throw 'obs-dlss5-nr.dll not found after build' }
+          Copy-Item README.md,LICENSE $package -ErrorAction SilentlyContinue
+          $zip = "release/obs-dlss5-nr-$($spec.version)-CPU-OPT-windows-x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path $package -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host "PACKAGE=$zip"
+
+      - name: Upload CPU-OPT artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-dlss5-nr-CPU-OPT-windows-x64
+          path: release/obs-dlss5-nr-*-CPU-OPT-windows-x64.zip
+          if-no-files-found: error
